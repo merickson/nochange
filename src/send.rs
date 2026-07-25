@@ -1,0 +1,1 @@
+//! RFC message sending boundary.
