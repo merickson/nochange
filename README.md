@@ -8,7 +8,8 @@ primary mailbox.
 The Graph-based rewrite is under active development. `nochange init`
 authenticates and verifies the configured Microsoft 365 identity, and
 `nochange sync` now performs incremental cloud-to-local synchronization.
-Local-to-cloud changes and sending are not operational yet.
+Local read and follow-up flag changes synchronize back to Graph. Local moves,
+trash operations, and sending are not operational yet.
 
 ## Build
 
@@ -167,10 +168,17 @@ punctuation. Only hierarchy separators, ambiguous percent signs, control
 characters, and filesystem-unsafe characters are escaped.
 
 This phase synchronizes cloud-created, changed, moved, and deleted messages to
-Maildir, including the `S` (read) and `F` (flagged) flags. It does not yet push
-local flag, move, or trash changes back to Microsoft 365. If cloud state
-replaces or deletes a locally edited tracked MIME file, Nochange preserves the
-local bytes in `.nochange-conflicts` before applying the cloud result.
+Maildir, including the `S` (read) and `F` (flagged) flags. Changes to `S` and
+`F` on clean tracked messages are journaled before being submitted to Microsoft
+Graph. Interrupted submissions replay idempotently, and the matching Graph
+delta echo completes the journal without downloading MIME again.
+
+Local moves, missing files, duplicate tracked keys, and content edits are
+reported but not changed remotely yet. `sync --dry-run` includes planned local
+flag updates and leaves both Graph and the local journal unchanged. If cloud
+state replaces or deletes a locally edited tracked MIME file, Nochange
+preserves the local bytes in `.nochange-conflicts` before applying the cloud
+result.
 
 ## CLI
 
@@ -212,8 +220,9 @@ for up to 1,000 changes per page and repeat that preference on continuation
 requests; Graph may return fewer. Synchronization uses deterministic Maildir
 keys, bounded four-at-a-time MIME transfers, serialized atomic Maildir delivery,
 SQLite-backed delta checkpoints, and cloud-wins conflict handling that
-preserves divergent local content. Later phases will add local-change scanning
-and journaled Graph mutations.
+preserves divergent local content. Local flag mutations use a durable SQLite
+journal and are cleared only after their matching delta echo is observed.
+Later phases will add local move and trash mutations.
 
 By default, SQLite, completed MIME files, and affected Maildir directories are
 synchronized durably before progress is committed. `sync --no-fsync` explicitly

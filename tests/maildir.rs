@@ -1,5 +1,6 @@
 use nochange::maildir::{MaildirError, MaildirStore, get_encoded_folder_path, get_maildir_key};
 use nochange::model::{FollowUpState, MessageFlags};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -90,6 +91,49 @@ fn configures_maildir_fsync_for_one_store() {
 
     assert!(durable.get_fsync_enabled());
     assert!(!buffered.get_fsync_enabled());
+}
+
+#[test]
+fn scans_only_known_message_keys_and_decodes_supported_flags() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let store = MaildirStore::new(temp.path());
+    store
+        .create_folder("Inbox")
+        .expect("Inbox should be created");
+    store
+        .create_folder("Archive")
+        .expect("Archive should be created");
+    fs::write(temp.path().join("Inbox/cur/tracked-key:2,DFPS"), b"tracked")
+        .expect("tracked message should be created");
+    fs::write(temp.path().join("Archive/new/moved-key"), b"moved")
+        .expect("moved message should be created");
+    fs::write(temp.path().join("Inbox/new/untracked-key"), b"untracked")
+        .expect("untracked message should be created");
+
+    let scanned = store
+        .scan_tracked_messages(
+            &["Inbox".into(), "Archive".into()],
+            &BTreeSet::from(["tracked-key".into(), "moved-key".into()]),
+        )
+        .expect("managed folders should scan");
+
+    assert_eq!(scanned["tracked-key"].len(), 1);
+    assert_eq!(
+        scanned["tracked-key"][0].relative_path,
+        "Inbox/cur/tracked-key:2,DFPS"
+    );
+    assert_eq!(
+        scanned["tracked-key"][0].flags,
+        MessageFlags {
+            is_read: true,
+            follow_up: FollowUpState::Flagged,
+        }
+    );
+    assert_eq!(
+        scanned["moved-key"][0].relative_path,
+        "Archive/new/moved-key"
+    );
+    assert!(!scanned.contains_key("untracked-key"));
 }
 
 #[test]

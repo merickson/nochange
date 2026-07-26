@@ -7,6 +7,7 @@ use crate::model::{
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use reqwest::Method;
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -221,6 +222,42 @@ where
         self.download_to(&url, destination).await
     }
 
+    /// Update the supported read and follow-up flags for one immutable message.
+    pub async fn update_message_flags(
+        &self,
+        message_id: &str,
+        flags: MessageFlags,
+    ) -> Result<(), GraphError> {
+        validate_resource_id(message_id)?;
+        let encoded_id = utf8_percent_encode(message_id, NON_ALPHANUMERIC);
+        let url = GraphUrl::build(&format!("/me/messages/{encoded_id}"))?;
+        self.update_message_flags_at(&url, flags).await
+    }
+
+    async fn update_message_flags_at(
+        &self,
+        url: &GraphUrl,
+        flags: MessageFlags,
+    ) -> Result<(), GraphError> {
+        let flag_status = match flags.follow_up {
+            FollowUpState::NotFlagged => "notFlagged",
+            FollowUpState::Flagged => "flagged",
+        };
+        let body = serde_json::json!({
+            "isRead": flags.is_read,
+            "flag": {"flagStatus": flag_status},
+        });
+        self.send_success_response(
+            Method::PATCH,
+            url,
+            "application/json",
+            IMMUTABLE_ID_PREFERENCE,
+            Some(&body),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Stream a successful Graph response to a newly created destination file.
     pub async fn download_to(
         &self,
@@ -351,6 +388,18 @@ where
         accept: &'static str,
         preference: &'static str,
     ) -> Result<reqwest::Response, GraphError> {
+        self.send_success_response(Method::GET, url, accept, preference, None)
+            .await
+    }
+
+    async fn send_success_response(
+        &self,
+        method: Method,
+        url: &GraphUrl,
+        accept: &'static str,
+        preference: &'static str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<reqwest::Response, GraphError> {
         let mut force_refresh = false;
         let mut refreshed_after_unauthorized = false;
         let mut retry_number = 0;
@@ -358,15 +407,16 @@ where
         loop {
             let access_token = self.token_provider.get_access_token(force_refresh).await?;
             force_refresh = false;
-            let response = self
+            let mut request = self
                 .http_client
-                .get(url.as_str())
+                .request(method.clone(), url.as_str())
                 .bearer_auth(access_token.expose_secret())
                 .header("Prefer", preference)
-                .header(reqwest::header::ACCEPT, accept)
-                .send()
-                .await
-                .map_err(classify_request_error)?;
+                .header(reqwest::header::ACCEPT, accept);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().await.map_err(classify_request_error)?;
             let status = response.status().as_u16();
             if status == 401 && !refreshed_after_unauthorized {
                 refreshed_after_unauthorized = true;
@@ -426,6 +476,13 @@ pub trait GraphApi: Send + Sync {
         message_id: &str,
         destination: &std::path::Path,
     ) -> Result<(), GraphError>;
+
+    /// Update supported flags for one immutable message.
+    async fn update_message_flags(
+        &self,
+        message_id: &str,
+        flags: MessageFlags,
+    ) -> Result<(), GraphError>;
 }
 
 #[async_trait]
@@ -455,6 +512,14 @@ where
         destination: &std::path::Path,
     ) -> Result<(), GraphError> {
         Self::download_message(self, message_id, destination).await
+    }
+
+    async fn update_message_flags(
+        &self,
+        message_id: &str,
+        flags: MessageFlags,
+    ) -> Result<(), GraphError> {
+        Self::update_message_flags(self, message_id, flags).await
     }
 }
 
@@ -774,7 +839,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use wiremock::matchers::{header, header_regex, method, path};
+    use wiremock::matchers::{body_json, header, header_regex, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[derive(Default)]
@@ -905,6 +970,39 @@ mod tests {
                 .expect("token calls should be readable"),
             [false]
         );
+    }
+
+    #[tokio::test]
+    async fn patches_supported_message_flags_with_replayable_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1.0/me/messages/message-id"))
+            .and(header("Authorization", "Bearer initial-access-token"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .and(body_json(serde_json::json!({
+                "isRead": true,
+                "flag": {"flagStatus": "flagged"}
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let transport = build_test_transport(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::new(RecordingSleeper::default()),
+            RetryPolicy::default(),
+        );
+
+        transport
+            .update_message_flags_at(
+                &build_test_url(&server, "/v1.0/me/messages/message-id"),
+                MessageFlags {
+                    is_read: true,
+                    follow_up: FollowUpState::Flagged,
+                },
+            )
+            .await
+            .expect("supported flags should patch");
     }
 
     #[tokio::test]

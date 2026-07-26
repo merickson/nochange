@@ -89,6 +89,8 @@ struct FakeGraph {
     folder_checkpoints: Mutex<Vec<Option<String>>>,
     message_checkpoints: Mutex<Vec<(String, Option<String>)>>,
     downloads: Mutex<Vec<String>>,
+    flag_updates: Mutex<Vec<(String, MessageFlags)>>,
+    flag_update_results: Mutex<VecDeque<Result<(), GraphError>>>,
     download_delay: Duration,
     active_downloads: AtomicUsize,
     max_active_downloads: AtomicUsize,
@@ -117,6 +119,8 @@ impl FakeGraph {
             folder_checkpoints: Mutex::default(),
             message_checkpoints: Mutex::default(),
             downloads: Mutex::default(),
+            flag_updates: Mutex::default(),
+            flag_update_results: Mutex::default(),
             download_delay: Duration::ZERO,
             active_downloads: AtomicUsize::default(),
             max_active_downloads: AtomicUsize::default(),
@@ -125,6 +129,16 @@ impl FakeGraph {
 
     fn with_download_delay(mut self, delay: Duration) -> Self {
         self.download_delay = delay;
+        self
+    }
+
+    fn with_flag_update_results(
+        self,
+        results: impl IntoIterator<Item = Result<(), GraphError>>,
+    ) -> Self {
+        if let Ok(mut stored) = self.flag_update_results.lock() {
+            stored.extend(results);
+        }
         self
     }
 }
@@ -198,6 +212,52 @@ impl GraphApi for FakeGraph {
         self.active_downloads.fetch_sub(1, Ordering::SeqCst);
         write_result
     }
+
+    async fn update_message_flags(
+        &self,
+        message_id: &str,
+        flags: MessageFlags,
+    ) -> Result<(), GraphError> {
+        self.flag_updates
+            .lock()
+            .map_err(|_| GraphError::Request)?
+            .push((message_id.to_owned(), flags));
+        self.flag_update_results
+            .lock()
+            .map_err(|_| GraphError::Request)?
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+}
+
+async fn synchronize_initial_message(
+    account: &AccountConfig,
+    state: &mut StateDatabase,
+    maildir: &MaildirStore,
+) {
+    let graph = FakeGraph::new(
+        [final_page(
+            vec![DeltaChange::Upsert(build_folder("inbox-id", None, "Inbox"))],
+            "folder-delta-initial",
+        )],
+        HashMap::from([(
+            "inbox-id".into(),
+            vec![final_page(
+                vec![DeltaChange::Upsert(build_message(
+                    "message-id",
+                    "inbox-id",
+                    "version-1",
+                    MessageFlags::default(),
+                ))],
+                "message-delta-initial",
+            )],
+        )]),
+        HashMap::from([("message-id".into(), vec![Ok(b"message".to_vec())])]),
+    );
+    CloudSynchronizer::new(&graph)
+        .sync_account(account, state, maildir, false)
+        .await
+        .expect("initial synchronization should succeed");
 }
 
 #[tokio::test]
@@ -283,6 +343,8 @@ async fn downloads_a_complete_multipage_folder_and_message_baseline() {
             updated: 0,
             deleted: 0,
             conflicted: 0,
+            local_flag_updates: 0,
+            local_ignored: 0,
         }
     );
     let first = state
@@ -312,6 +374,352 @@ async fn downloads_a_complete_multipage_folder_and_message_baseline() {
         Some(
             "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=message-final"
         )
+    );
+}
+
+#[tokio::test]
+async fn pushes_local_flags_and_suppresses_the_matching_delta_echo() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    synchronize_initial_message(&account, &mut state, &maildir).await;
+    let stored = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    let desired = MessageFlags {
+        is_read: true,
+        follow_up: FollowUpState::Flagged,
+    };
+    let local_relative_path = maildir
+        .set_flags(&stored.relative_path, desired)
+        .expect("local flags should change");
+    let graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-flags")],
+        HashMap::from([(
+            "inbox-id".into(),
+            vec![final_page(
+                vec![DeltaChange::Upsert(build_message(
+                    "message-id",
+                    "inbox-id",
+                    "version-2",
+                    desired,
+                ))],
+                "message-delta-flags",
+            )],
+        )]),
+        HashMap::new(),
+    )
+    .with_flag_update_results([Ok(())]);
+
+    let summary = CloudSynchronizer::new(&graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("local flag synchronization should succeed");
+
+    assert_eq!(summary.local_flag_updates, 1);
+    assert_eq!(
+        *graph
+            .flag_updates
+            .lock()
+            .expect("flag updates should be readable"),
+        [("message-id".into(), desired)]
+    );
+    assert!(
+        graph
+            .downloads
+            .lock()
+            .expect("downloads should be readable")
+            .is_empty()
+    );
+    assert!(
+        state
+            .list_pending_flag_operations("work")
+            .expect("pending operations should load")
+            .is_empty()
+    );
+    let synchronized = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    assert_eq!(synchronized.flags, desired);
+    assert_eq!(synchronized.relative_path, local_relative_path);
+    assert_eq!(synchronized.remote_version, "version-2");
+}
+
+#[tokio::test]
+async fn dry_run_plans_local_flags_without_graph_or_state_mutation() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    synchronize_initial_message(&account, &mut state, &maildir).await;
+    let stored = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    maildir
+        .set_flags(
+            &stored.relative_path,
+            MessageFlags {
+                is_read: true,
+                follow_up: FollowUpState::NotFlagged,
+            },
+        )
+        .expect("local read flag should change");
+    let graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-dry-local")],
+        HashMap::from([(
+            "inbox-id".into(),
+            vec![final_page(vec![], "message-delta-dry-local")],
+        )]),
+        HashMap::new(),
+    );
+
+    let summary = CloudSynchronizer::new(&graph)
+        .sync_account(&account, &mut state, &maildir, true)
+        .await
+        .expect("dry-run should plan local flags");
+
+    assert_eq!(summary.local_flag_updates, 1);
+    assert!(
+        graph
+            .flag_updates
+            .lock()
+            .expect("flag updates should be readable")
+            .is_empty()
+    );
+    assert!(
+        state
+            .list_pending_flag_operations("work")
+            .expect("pending operations should load")
+            .is_empty()
+    );
+    assert_eq!(
+        state
+            .get_message("work", "message-id")
+            .expect("message should load")
+            .expect("message should exist")
+            .flags,
+        MessageFlags::default()
+    );
+}
+
+#[tokio::test]
+async fn replays_a_journaled_flag_update_after_graph_failure() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    synchronize_initial_message(&account, &mut state, &maildir).await;
+    let stored = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    let desired = MessageFlags {
+        is_read: true,
+        follow_up: FollowUpState::NotFlagged,
+    };
+    maildir
+        .set_flags(&stored.relative_path, desired)
+        .expect("local read flag should change");
+    let failing_graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-failure")],
+        HashMap::new(),
+        HashMap::new(),
+    )
+    .with_flag_update_results([Err(GraphError::Request)]);
+
+    let first_result = CloudSynchronizer::new(&failing_graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await;
+
+    assert!(matches!(
+        first_result,
+        Err(SyncError::Graph(GraphError::Request))
+    ));
+    let pending = state
+        .list_pending_flag_operations("work")
+        .expect("pending operation should survive");
+    assert_eq!(pending.len(), 1);
+    assert!(!pending[0].submitted);
+
+    let replay_graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-replay")],
+        HashMap::from([(
+            "inbox-id".into(),
+            vec![final_page(
+                vec![DeltaChange::Upsert(build_message(
+                    "message-id",
+                    "inbox-id",
+                    "version-2",
+                    desired,
+                ))],
+                "message-delta-replay",
+            )],
+        )]),
+        HashMap::new(),
+    )
+    .with_flag_update_results([Ok(())]);
+
+    CloudSynchronizer::new(&replay_graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("journaled flag update should replay");
+
+    assert_eq!(
+        *replay_graph
+            .flag_updates
+            .lock()
+            .expect("flag updates should be readable"),
+        [("message-id".into(), desired)]
+    );
+    assert!(
+        state
+            .list_pending_flag_operations("work")
+            .expect("matching echo should complete journal")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn classifies_unsupported_local_changes_without_remote_mutation() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    let message_changes = ["missing-id", "moved-id", "duplicate-id", "edited-id"]
+        .into_iter()
+        .map(|id| {
+            DeltaChange::Upsert(build_message(
+                id,
+                "inbox-id",
+                "version-1",
+                MessageFlags::default(),
+            ))
+        })
+        .collect();
+    let initial_graph = FakeGraph::new(
+        [final_page(
+            vec![
+                DeltaChange::Upsert(build_folder("inbox-id", None, "Inbox")),
+                DeltaChange::Upsert(build_folder("archive-id", None, "Archive")),
+            ],
+            "folder-delta-local-classification",
+        )],
+        HashMap::from([
+            (
+                "inbox-id".into(),
+                vec![final_page(message_changes, "inbox-delta-initial")],
+            ),
+            (
+                "archive-id".into(),
+                vec![final_page(vec![], "archive-delta-initial")],
+            ),
+        ]),
+        HashMap::from([
+            ("missing-id".into(), vec![Ok(b"missing".to_vec())]),
+            ("moved-id".into(), vec![Ok(b"moved".to_vec())]),
+            ("duplicate-id".into(), vec![Ok(b"duplicate".to_vec())]),
+            ("edited-id".into(), vec![Ok(b"edited".to_vec())]),
+        ]),
+    );
+    CloudSynchronizer::new(&initial_graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("initial synchronization should succeed");
+
+    let missing = state
+        .get_message("work", "missing-id")
+        .expect("message should load")
+        .expect("missing candidate should exist");
+    maildir
+        .remove_message(&missing.relative_path)
+        .expect("message should be removed locally");
+    let moved = state
+        .get_message("work", "moved-id")
+        .expect("message should load")
+        .expect("move candidate should exist");
+    std::fs::rename(
+        account.maildir.join(&moved.relative_path),
+        account
+            .maildir
+            .join(format!("Archive/new/{}", moved.maildir_key)),
+    )
+    .expect("message should move locally");
+    let duplicate = state
+        .get_message("work", "duplicate-id")
+        .expect("message should load")
+        .expect("duplicate candidate should exist");
+    std::fs::copy(
+        account.maildir.join(&duplicate.relative_path),
+        account
+            .maildir
+            .join(format!("Inbox/cur/{}:2,S", duplicate.maildir_key)),
+    )
+    .expect("duplicate message should be created");
+    let edited = state
+        .get_message("work", "edited-id")
+        .expect("message should load")
+        .expect("edited candidate should exist");
+    let edited_path = maildir
+        .set_flags(
+            &edited.relative_path,
+            MessageFlags {
+                is_read: true,
+                follow_up: FollowUpState::NotFlagged,
+            },
+        )
+        .expect("edited candidate flags should change");
+    std::fs::write(account.maildir.join(edited_path), b"local edit")
+        .expect("message content should be edited");
+    let graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-local-dry")],
+        HashMap::from([
+            (
+                "inbox-id".into(),
+                vec![final_page(vec![], "inbox-delta-local-dry")],
+            ),
+            (
+                "archive-id".into(),
+                vec![final_page(vec![], "archive-delta-local-dry")],
+            ),
+        ]),
+        HashMap::new(),
+    );
+    let reporter = RecordingProgressReporter::default();
+
+    let summary = CloudSynchronizer::new_with_reporter(&graph, &reporter)
+        .sync_account(&account, &mut state, &maildir, true)
+        .await
+        .expect("dry-run should classify unsupported local changes");
+
+    assert_eq!(summary.local_flag_updates, 0);
+    assert_eq!(summary.local_ignored, 4);
+    assert!(
+        reporter
+            .events
+            .lock()
+            .expect("progress events should load")
+            .contains(&SyncProgress::LocalScanCompleted {
+                flag_updates: 0,
+                moved: 1,
+                missing: 1,
+                duplicates: 1,
+                edited: 1,
+            })
+    );
+    assert!(
+        graph
+            .flag_updates
+            .lock()
+            .expect("flag updates should load")
+            .is_empty()
     );
 }
 
@@ -649,6 +1057,8 @@ async fn dry_run_plans_changes_without_downloading_or_mutating_local_state() {
             updated: 0,
             deleted: 0,
             conflicted: 0,
+            local_flag_updates: 0,
+            local_ignored: 0,
         }
     );
     assert!(

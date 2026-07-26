@@ -3,7 +3,7 @@
 use crate::model::{FollowUpState, MessageFlags};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +27,15 @@ pub struct ReplacedMessage {
     pub delivered: DeliveredMessage,
     /// Preserved divergent local content, when one was detected.
     pub conflict_path: Option<String>,
+}
+
+/// One managed Maildir file correlated by its deterministic message key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannedMessage {
+    /// Account-root-relative current path.
+    pub relative_path: String,
+    /// Supported flags parsed from the Maildir filename.
+    pub flags: MessageFlags,
 }
 
 /// Filesystem adapter rooted at one configured account Maildir.
@@ -53,6 +62,57 @@ impl MaildirStore {
     /// Return whether this store synchronizes files and directories durably.
     pub fn get_fsync_enabled(&self) -> bool {
         self.fsync_enabled
+    }
+
+    /// Scan selected folders and return files whose keys are already tracked.
+    pub fn scan_tracked_messages(
+        &self,
+        local_paths: &[String],
+        tracked_keys: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Vec<ScannedMessage>>, MaildirError> {
+        let mut scanned: BTreeMap<String, Vec<ScannedMessage>> = BTreeMap::new();
+        for local_path in local_paths {
+            for subdirectory in ["new", "cur"] {
+                let directory = self.get_safe_path(local_path)?.join(subdirectory);
+                for entry in fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let file_name = entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| MaildirError::UnsafePath)?;
+                    let (maildir_key, flags) = split_maildir_name(&file_name);
+                    if !tracked_keys.contains(maildir_key) {
+                        continue;
+                    }
+                    scanned
+                        .entry(maildir_key.to_owned())
+                        .or_default()
+                        .push(ScannedMessage {
+                            relative_path: format!("{local_path}/{subdirectory}/{file_name}"),
+                            flags: MessageFlags {
+                                is_read: flags.contains('S'),
+                                follow_up: if flags.contains('F') {
+                                    FollowUpState::Flagged
+                                } else {
+                                    FollowUpState::NotFlagged
+                                },
+                            },
+                        });
+                }
+            }
+        }
+        for messages in scanned.values_mut() {
+            messages.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        }
+        Ok(scanned)
+    }
+
+    /// Hash one safely resolved managed message for local-edit detection.
+    pub fn get_message_hash(&self, relative_path: &str) -> Result<String, MaildirError> {
+        get_file_hash(&self.get_safe_path(relative_path)?)
     }
 
     /// Create one selected remote folder as a private Maildir.

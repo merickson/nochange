@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// Persisted remote-folder baseline and checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +52,19 @@ pub struct StoredMessage {
     pub internet_message_id: Option<String>,
     /// Last synchronized flags.
     pub flags: MessageFlags,
+}
+
+/// Durable local flag mutation awaiting submission or its matching delta echo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFlagOperation {
+    /// Immutable Microsoft Graph message ID.
+    pub message_id: String,
+    /// Desired supported Graph flags.
+    pub flags: MessageFlags,
+    /// Current local Maildir path containing those flags.
+    pub relative_path: String,
+    /// Whether Graph accepted the mutation request.
+    pub submitted: bool,
 }
 
 /// Open, migrated synchronization-state database.
@@ -340,6 +353,99 @@ impl StateDatabase {
         )?;
         Ok(())
     }
+
+    /// Insert or replace a desired local flag mutation before contacting Graph.
+    pub fn upsert_pending_flag_operation(
+        &mut self,
+        account: &str,
+        operation: &PendingFlagOperation,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO pending_operations(
+                account_name, message_id, operation_kind, desired_is_read,
+                desired_is_flagged, local_relative_path, submitted
+             ) VALUES (?1, ?2, 'flags', ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_name, message_id, operation_kind) DO UPDATE SET
+                desired_is_read = excluded.desired_is_read,
+                desired_is_flagged = excluded.desired_is_flagged,
+                local_relative_path = excluded.local_relative_path,
+                submitted = excluded.submitted",
+            params![
+                account,
+                operation.message_id,
+                operation.flags.is_read,
+                operation.flags.follow_up == FollowUpState::Flagged,
+                operation.relative_path,
+                operation.submitted,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List pending flag mutations in deterministic message-ID order.
+    pub fn list_pending_flag_operations(
+        &self,
+        account: &str,
+    ) -> Result<Vec<PendingFlagOperation>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id, desired_is_read, desired_is_flagged,
+                    local_relative_path, submitted
+             FROM pending_operations
+             WHERE account_name = ?1 AND operation_kind = 'flags'
+             ORDER BY message_id",
+        )?;
+        let operations = statement
+            .query_map([account], |row| {
+                let is_flagged: bool = row.get(2)?;
+                Ok(PendingFlagOperation {
+                    message_id: row.get(0)?,
+                    flags: MessageFlags {
+                        is_read: row.get(1)?,
+                        follow_up: if is_flagged {
+                            FollowUpState::Flagged
+                        } else {
+                            FollowUpState::NotFlagged
+                        },
+                    },
+                    relative_path: row.get(3)?,
+                    submitted: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(operations)
+    }
+
+    /// Mark a journaled flag mutation as accepted by Graph.
+    pub fn mark_pending_flag_operation_submitted(
+        &mut self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<(), StateError> {
+        let changed = self.connection.execute(
+            "UPDATE pending_operations SET submitted = 1
+             WHERE account_name = ?1 AND message_id = ?2 AND operation_kind = 'flags'",
+            params![account, message_id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StateError::UnknownPendingOperation)
+        }
+    }
+
+    /// Delete a completed flag mutation idempotently.
+    pub fn delete_pending_flag_operation(
+        &mut self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "DELETE FROM pending_operations
+             WHERE account_name = ?1 AND message_id = ?2 AND operation_kind = 'flags'",
+            params![account, message_id],
+        )?;
+        Ok(())
+    }
 }
 
 /// Exclusive per-account interprocess lock guard.
@@ -401,6 +507,9 @@ pub enum StateError {
     /// Another process currently holds the selected account lock.
     #[error("another Nochange process is already synchronizing this account")]
     AccountLocked,
+    /// A pending operation disappeared before its lifecycle update.
+    #[error("a pending synchronization operation was not found")]
+    UnknownPendingOperation,
 }
 
 fn create_private_file(path: &Path) -> Result<(), StateError> {
@@ -474,7 +583,19 @@ fn migrate_database(connection: &mut Connection) -> Result<(), StateError> {
                 FOREIGN KEY (account_name, folder_id)
                     REFERENCES folders(account_name, id) ON DELETE CASCADE
              );
-             PRAGMA user_version = 2;",
+             CREATE TABLE pending_operations (
+                account_name TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                operation_kind TEXT NOT NULL CHECK (operation_kind = 'flags'),
+                desired_is_read INTEGER NOT NULL CHECK (desired_is_read IN (0, 1)),
+                desired_is_flagged INTEGER NOT NULL CHECK (desired_is_flagged IN (0, 1)),
+                local_relative_path TEXT NOT NULL,
+                submitted INTEGER NOT NULL CHECK (submitted IN (0, 1)),
+                PRIMARY KEY (account_name, message_id, operation_kind),
+                FOREIGN KEY (account_name, message_id)
+                    REFERENCES messages(account_name, id) ON DELETE CASCADE
+             );
+             PRAGMA user_version = 3;",
         )?;
         transaction.commit()?;
     } else if version == 1 {
@@ -483,7 +604,37 @@ fn migrate_database(connection: &mut Connection) -> Result<(), StateError> {
             "ALTER TABLE folders
                 ADD COLUMN total_item_count INTEGER NOT NULL DEFAULT 0
                 CHECK (total_item_count >= 0);
-             PRAGMA user_version = 2;",
+             CREATE TABLE pending_operations (
+                account_name TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                operation_kind TEXT NOT NULL CHECK (operation_kind = 'flags'),
+                desired_is_read INTEGER NOT NULL CHECK (desired_is_read IN (0, 1)),
+                desired_is_flagged INTEGER NOT NULL CHECK (desired_is_flagged IN (0, 1)),
+                local_relative_path TEXT NOT NULL,
+                submitted INTEGER NOT NULL CHECK (submitted IN (0, 1)),
+                PRIMARY KEY (account_name, message_id, operation_kind),
+                FOREIGN KEY (account_name, message_id)
+                    REFERENCES messages(account_name, id) ON DELETE CASCADE
+             );
+             PRAGMA user_version = 3;",
+        )?;
+        transaction.commit()?;
+    } else if version == 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE pending_operations (
+                account_name TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                operation_kind TEXT NOT NULL CHECK (operation_kind = 'flags'),
+                desired_is_read INTEGER NOT NULL CHECK (desired_is_read IN (0, 1)),
+                desired_is_flagged INTEGER NOT NULL CHECK (desired_is_flagged IN (0, 1)),
+                local_relative_path TEXT NOT NULL,
+                submitted INTEGER NOT NULL CHECK (submitted IN (0, 1)),
+                PRIMARY KEY (account_name, message_id, operation_kind),
+                FOREIGN KEY (account_name, message_id)
+                    REFERENCES messages(account_name, id) ON DELETE CASCADE
+             );
+             PRAGMA user_version = 3;",
         )?;
         transaction.commit()?;
     }

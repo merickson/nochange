@@ -1,6 +1,7 @@
 use nochange::model::{FollowUpState, MessageFlags};
 use nochange::state::{
-    StateDatabase, StateError, StoredFolder, StoredMessage, get_account_lock_path,
+    PendingFlagOperation, StateDatabase, StateError, StoredFolder, StoredMessage,
+    get_account_lock_path,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -44,7 +45,7 @@ fn creates_a_private_versioned_wal_database() {
 
     assert_eq!(
         database.get_schema_version().expect("version should load"),
-        2
+        3
     );
     assert_eq!(
         database
@@ -70,6 +71,59 @@ fn creates_a_private_versioned_wal_database() {
             0o600
         );
     }
+}
+
+#[test]
+fn journals_pending_flag_updates_through_submission_and_completion() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let mut database =
+        StateDatabase::open(&temp.path().join("state.sqlite3")).expect("database should open");
+    database
+        .ensure_account("work", "me@example.com")
+        .expect("account should be recorded");
+    database
+        .upsert_folder("work", &build_folder("inbox-id", "Inbox"))
+        .expect("folder should be stored");
+    database
+        .upsert_message("work", &build_message("message-id", "inbox-id"))
+        .expect("message should be stored");
+    let operation = PendingFlagOperation {
+        message_id: "message-id".into(),
+        flags: MessageFlags {
+            is_read: false,
+            follow_up: FollowUpState::NotFlagged,
+        },
+        relative_path: "Inbox/new/key-message-id".into(),
+        submitted: false,
+    };
+
+    database
+        .upsert_pending_flag_operation("work", &operation)
+        .expect("pending operation should be stored");
+    assert_eq!(
+        database
+            .list_pending_flag_operations("work")
+            .expect("pending operations should load"),
+        std::slice::from_ref(&operation)
+    );
+
+    database
+        .mark_pending_flag_operation_submitted("work", "message-id")
+        .expect("pending operation should be marked submitted");
+    let submitted = database
+        .list_pending_flag_operations("work")
+        .expect("submitted operation should load");
+    assert!(submitted[0].submitted);
+
+    database
+        .delete_pending_flag_operation("work", "message-id")
+        .expect("pending operation should complete");
+    assert!(
+        database
+            .list_pending_flag_operations("work")
+            .expect("completed journal should be empty")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -131,7 +185,7 @@ fn migrates_version_one_folders_with_an_unknown_item_count() {
 
     assert_eq!(
         database.get_schema_version().expect("version should load"),
-        2
+        3
     );
     assert_eq!(folder.total_item_count, 0);
 }
@@ -153,6 +207,67 @@ fn pins_each_local_account_to_its_verified_identity() {
         database.ensure_account("work", "other@example.com"),
         Err(StateError::AccountIdentityMismatch { .. })
     ));
+}
+
+#[test]
+fn migrates_version_two_state_with_an_empty_operation_journal() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let path = temp.path().join("state.sqlite3");
+    let connection = rusqlite::Connection::open(&path).expect("database should be created");
+    connection
+        .execute_batch(
+            "CREATE TABLE accounts (
+                name TEXT PRIMARY KEY NOT NULL,
+                user_identity TEXT NOT NULL,
+                folder_delta_link TEXT
+             );
+             CREATE TABLE folders (
+                account_name TEXT NOT NULL,
+                id TEXT NOT NULL,
+                parent_id TEXT,
+                display_name TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                is_selected INTEGER NOT NULL,
+                is_hidden INTEGER NOT NULL,
+                total_item_count INTEGER NOT NULL,
+                message_delta_link TEXT,
+                PRIMARY KEY (account_name, id),
+                FOREIGN KEY (account_name) REFERENCES accounts(name) ON DELETE CASCADE
+             );
+             CREATE TABLE messages (
+                account_name TEXT NOT NULL,
+                id TEXT NOT NULL,
+                folder_id TEXT NOT NULL,
+                maildir_key TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                mime_hash TEXT NOT NULL,
+                remote_version TEXT NOT NULL,
+                internet_message_id TEXT,
+                is_read INTEGER NOT NULL,
+                is_flagged INTEGER NOT NULL,
+                PRIMARY KEY (account_name, id),
+                UNIQUE (account_name, maildir_key),
+                FOREIGN KEY (account_name, folder_id)
+                    REFERENCES folders(account_name, id) ON DELETE CASCADE
+             );
+             PRAGMA user_version = 2;",
+        )
+        .expect("version two schema should be created");
+    drop(connection);
+
+    let database = StateDatabase::open(&path).expect("version two database should migrate");
+
+    assert_eq!(
+        database.get_schema_version().expect("version should load"),
+        3
+    );
+    assert!(
+        database
+            .list_pending_flag_operations("work")
+            .expect("new operation journal should be readable")
+            .is_empty()
+    );
 }
 
 #[test]

@@ -211,6 +211,27 @@ fn get_sync_progress_message(progress: &SyncProgress, verbose: bool) -> Option<S
         } => Some(format!(
             "folder enumeration complete: {discovered} discovered, {selected} selected"
         )),
+        SyncProgress::LocalScanStarted { folders, tracked } => Some(format!(
+            "scanning {tracked} tracked messages in {folders} managed folders"
+        )),
+        SyncProgress::LocalScanCompleted {
+            flag_updates,
+            moved,
+            missing,
+            duplicates,
+            edited,
+        } => Some(format!(
+            "local scan complete: {flag_updates} flag updates, {moved} moves deferred, {missing} missing, {duplicates} duplicate, {edited} edited"
+        )),
+        SyncProgress::LocalFlagApplyStarted { total } => {
+            Some(format!("submitting {total} local flag updates"))
+        }
+        SyncProgress::LocalFlagApplyProgress { position, total }
+            if verbose || *position == 1 || *position == *total || *position % 100 == 0 =>
+        {
+            Some(format!("submitting local flag update {position}/{total}"))
+        }
+        SyncProgress::LocalFlagApplyProgress { .. } => None,
         SyncProgress::MessageFolderStarted {
             folder,
             position,
@@ -329,8 +350,14 @@ fn show_sync_summary(account: &str, summary: SyncSummary, dry_run: bool) {
         "synchronized"
     };
     println!(
-        "Account '{account}' {qualifier} {} folders: {} created, {} updated, {} deleted, {} conflicts.",
-        summary.folders, summary.created, summary.updated, summary.deleted, summary.conflicted,
+        "Account '{account}' {qualifier} {} folders: {} created, {} updated, {} deleted, {} conflicts, {} local flag updates, {} local changes deferred.",
+        summary.folders,
+        summary.created,
+        summary.updated,
+        summary.deleted,
+        summary.conflicted,
+        summary.local_flag_updates,
+        summary.local_ignored,
     );
 }
 
@@ -383,6 +410,43 @@ mod tests {
             Some(
                 "folder 'Inbox': page 2 returned 25 changes, 125 accumulated, approximately 25.0% (more pages)"
             )
+        );
+        assert_eq!(
+            get_sync_progress_message(
+                &SyncProgress::LocalScanCompleted {
+                    flag_updates: 4,
+                    moved: 2,
+                    missing: 1,
+                    duplicates: 0,
+                    edited: 3,
+                },
+                false,
+            )
+            .as_deref(),
+            Some(
+                "local scan complete: 4 flag updates, 2 moves deferred, 1 missing, 0 duplicate, 3 edited"
+            )
+        );
+        assert!(
+            get_sync_progress_message(
+                &SyncProgress::LocalFlagApplyProgress {
+                    position: 2,
+                    total: 4,
+                },
+                false,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            get_sync_progress_message(
+                &SyncProgress::LocalFlagApplyProgress {
+                    position: 2,
+                    total: 4,
+                },
+                true,
+            )
+            .as_deref(),
+            Some("submitting local flag update 2/4")
         );
     }
 

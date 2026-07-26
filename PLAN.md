@@ -249,7 +249,10 @@ Every phase follows red-green-refactor: write behavior tests first, confirm they
    - Implement folder selection, initial delta rounds, incremental message changes, MIME streaming, remote moves/deletes, checkpoint commits, safe token reset, and dry-run planning.
 
 5. **Local-to-cloud synchronization**
-   - Add Seen/Flagged propagation, trash semantics, managed-folder moves, physical-deletion correlation, pending-operation replay, own-change suppression, and cloud-wins conflict handling.
+   - Seen/Flagged propagation, pending-operation replay, and own-change
+     suppression are implemented.
+   - Add trash semantics, managed-folder moves, physical-deletion correlation,
+     and remaining cloud-wins conflict handling.
 
 6. **Sending and release hardening**
    - Implement RFC parsing, recipient safety, MIME Graph sending, sendmail exit codes, multi-account behavior, documentation, sample configuration, and recovery guidance.

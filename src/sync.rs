@@ -4,7 +4,7 @@ use crate::config::AccountConfig;
 use crate::graph::{GraphApi, GraphError};
 use crate::maildir::{MaildirError, MaildirStore, get_encoded_folder_path, get_maildir_key};
 use crate::model::{DeltaChange, RemoteFolderMetadata, RemoteMessage};
-use crate::state::{StateDatabase, StateError, StoredFolder, StoredMessage};
+use crate::state::{PendingFlagOperation, StateDatabase, StateError, StoredFolder, StoredMessage};
 use futures_util::future::join_all;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
@@ -27,6 +27,10 @@ pub struct SyncSummary {
     pub deleted: usize,
     /// Number of divergent local messages preserved as conflict copies.
     pub conflicted: usize,
+    /// Number of local supported flag changes submitted or planned for Graph.
+    pub local_flag_updates: usize,
+    /// Number of local missing, moved, duplicated, or edited tracked files deferred.
+    pub local_ignored: usize,
 }
 
 /// High-level action kind reported without exposing a remote message ID.
@@ -66,6 +70,38 @@ pub enum SyncProgress {
         discovered: usize,
         /// Number of folders selected for message enumeration.
         selected: usize,
+    },
+    /// Local tracked-message scanning is starting.
+    LocalScanStarted {
+        /// Number of selected managed folders.
+        folders: usize,
+        /// Number of tracked message baselines.
+        tracked: usize,
+    },
+    /// Local tracked-message scanning completed.
+    LocalScanCompleted {
+        /// Supported flag mutations discovered.
+        flag_updates: usize,
+        /// Tracked messages found in a different managed folder.
+        moved: usize,
+        /// Tracked messages absent from managed folders.
+        missing: usize,
+        /// Tracked keys with multiple managed files.
+        duplicates: usize,
+        /// Flag-change candidates whose MIME diverged locally.
+        edited: usize,
+    },
+    /// Journaled local flag mutations are being submitted.
+    LocalFlagApplyStarted {
+        /// Number of Graph mutations to submit in this run.
+        total: usize,
+    },
+    /// One journaled local flag mutation is being submitted.
+    LocalFlagApplyProgress {
+        /// One-based mutation position.
+        position: usize,
+        /// Total mutations submitted in this run.
+        total: usize,
     },
     /// Message enumeration is starting for one selected folder.
     MessageFolderStarted {
@@ -187,7 +223,9 @@ where
             });
 
         if dry_run {
-            return self.get_dry_run_summary(account, state, &folders).await;
+            return self
+                .get_dry_run_summary(account, state, maildir, &folders)
+                .await;
         }
 
         state.ensure_account(&account.name, &account.user)?;
@@ -201,14 +239,192 @@ where
             .cloned()
             .collect();
         summary.folders = selected.len();
+        let local_plan = self.build_local_flag_plan(account, state, maildir, &selected)?;
+        summary.local_ignored = local_plan.get_ignored_count();
+        self.apply_local_flag_plan(account, state, local_plan, &mut summary)
+            .await?;
         let rounds = self.collect_message_rounds(&selected).await?;
-        let changes = collapse_message_changes(&rounds);
+        let mut changes = collapse_message_changes(&rounds);
+        self.suppress_local_flag_echoes(account, state, maildir, &mut changes)?;
         self.apply_message_changes(account, state, maildir, changes, &mut summary)
             .await?;
         for round in rounds {
             state.set_message_delta_link(&account.name, &round.folder_id, &round.delta_link)?;
         }
         Ok(summary)
+    }
+
+    fn build_local_flag_plan(
+        &self,
+        account: &AccountConfig,
+        state: &StateDatabase,
+        maildir: &MaildirStore,
+        folders: &[StoredFolder],
+    ) -> Result<LocalFlagPlan, SyncError> {
+        let mut messages = Vec::new();
+        let mut folder_paths = HashMap::new();
+        for folder in folders {
+            folder_paths.insert(folder.id.clone(), folder.local_path.clone());
+            messages.extend(state.list_messages(&account.name, &folder.id)?);
+        }
+        self.reporter.report(SyncProgress::LocalScanStarted {
+            folders: folders.len(),
+            tracked: messages.len(),
+        });
+        if messages.is_empty() {
+            let plan = LocalFlagPlan::default();
+            self.report_local_scan(&plan);
+            return Ok(plan);
+        }
+        let tracked_keys: BTreeSet<String> = messages
+            .iter()
+            .map(|message| message.maildir_key.clone())
+            .collect();
+        let local_paths: Vec<String> = folders
+            .iter()
+            .map(|folder| folder.local_path.clone())
+            .collect();
+        let scanned = maildir.scan_tracked_messages(&local_paths, &tracked_keys)?;
+        let pending: HashMap<String, PendingFlagOperation> = state
+            .list_pending_flag_operations(&account.name)?
+            .into_iter()
+            .map(|operation| (operation.message_id.clone(), operation))
+            .collect();
+        let mut plan = LocalFlagPlan::default();
+        for message in messages {
+            let matches = scanned
+                .get(&message.maildir_key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let [local] = matches else {
+                if matches.is_empty() {
+                    plan.missing += 1;
+                } else {
+                    plan.duplicates += 1;
+                }
+                continue;
+            };
+            let expected_folder = folder_paths
+                .get(&message.folder_id)
+                .ok_or_else(|| StateError::UnknownFolder(message.folder_id.clone()))?;
+            if !local
+                .relative_path
+                .strip_prefix(expected_folder)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                plan.moved += 1;
+                continue;
+            }
+            if local.flags == message.flags {
+                continue;
+            }
+            if maildir.get_message_hash(&local.relative_path)? != message.mime_hash {
+                plan.edited += 1;
+                continue;
+            }
+            let operation = PendingFlagOperation {
+                message_id: message.id.clone(),
+                flags: local.flags,
+                relative_path: local.relative_path.clone(),
+                submitted: false,
+            };
+            let needs_journal = pending.get(&message.id).is_none_or(|existing| {
+                existing.flags != operation.flags
+                    || existing.relative_path != operation.relative_path
+            });
+            plan.flag_updates.push(PlannedFlagUpdate {
+                operation,
+                needs_journal,
+            });
+        }
+        self.report_local_scan(&plan);
+        Ok(plan)
+    }
+
+    fn report_local_scan(&self, plan: &LocalFlagPlan) {
+        self.reporter.report(SyncProgress::LocalScanCompleted {
+            flag_updates: plan.flag_updates.len(),
+            moved: plan.moved,
+            missing: plan.missing,
+            duplicates: plan.duplicates,
+            edited: plan.edited,
+        });
+    }
+
+    async fn apply_local_flag_plan(
+        &self,
+        account: &AccountConfig,
+        state: &mut StateDatabase,
+        plan: LocalFlagPlan,
+        summary: &mut SyncSummary,
+    ) -> Result<(), SyncError> {
+        for planned in plan.flag_updates {
+            if planned.needs_journal {
+                state.upsert_pending_flag_operation(&account.name, &planned.operation)?;
+            }
+        }
+        let pending: Vec<PendingFlagOperation> = state
+            .list_pending_flag_operations(&account.name)?
+            .into_iter()
+            .filter(|operation| !operation.submitted)
+            .collect();
+        summary.local_flag_updates = pending.len();
+        self.reporter.report(SyncProgress::LocalFlagApplyStarted {
+            total: pending.len(),
+        });
+        for (index, operation) in pending.into_iter().enumerate() {
+            self.reporter.report(SyncProgress::LocalFlagApplyProgress {
+                position: index + 1,
+                total: summary.local_flag_updates,
+            });
+            self.graph
+                .update_message_flags(&operation.message_id, operation.flags)
+                .await?;
+            state.mark_pending_flag_operation_submitted(&account.name, &operation.message_id)?;
+        }
+        Ok(())
+    }
+
+    fn suppress_local_flag_echoes(
+        &self,
+        account: &AccountConfig,
+        state: &mut StateDatabase,
+        maildir: &MaildirStore,
+        changes: &mut BTreeMap<String, DeltaChange<RemoteMessage>>,
+    ) -> Result<(), SyncError> {
+        let pending = state.list_pending_flag_operations(&account.name)?;
+        for operation in pending {
+            if !operation.submitted {
+                continue;
+            }
+            let Some(DeltaChange::Upsert(remote)) = changes.get(&operation.message_id) else {
+                continue;
+            };
+            let Some(existing) = state.get_message(&account.name, &operation.message_id)? else {
+                continue;
+            };
+            if remote.folder_id != existing.folder_id
+                || remote.flags != operation.flags
+                || !maildir
+                    .get_message_path(&operation.relative_path)?
+                    .is_file()
+                || maildir.get_message_hash(&operation.relative_path)? != existing.mime_hash
+            {
+                continue;
+            }
+            state.upsert_message(
+                &account.name,
+                &build_stored_message(
+                    remote,
+                    existing.maildir_key,
+                    operation.relative_path,
+                    existing.mime_hash,
+                ),
+            )?;
+            state.delete_pending_flag_operation(&account.name, &operation.message_id)?;
+            changes.remove(&operation.message_id);
+        }
+        Ok(())
     }
 
     async fn collect_folder_changes(
@@ -521,6 +737,7 @@ where
         &self,
         account: &AccountConfig,
         state: &StateDatabase,
+        maildir: &MaildirStore,
         folders: &BTreeMap<String, StoredFolder>,
     ) -> Result<SyncSummary, SyncError> {
         let selected: Vec<StoredFolder> = folders
@@ -534,6 +751,20 @@ where
             folders: selected.len(),
             ..SyncSummary::default()
         };
+        let local_plan = self.build_local_flag_plan(account, state, maildir, &selected)?;
+        summary.local_flag_updates = local_plan.flag_updates.len()
+            + state
+                .list_pending_flag_operations(&account.name)?
+                .iter()
+                .filter(|operation| !operation.submitted)
+                .filter(|operation| {
+                    !local_plan
+                        .flag_updates
+                        .iter()
+                        .any(|planned| planned.operation.message_id == operation.message_id)
+                })
+                .count();
+        summary.local_ignored = local_plan.get_ignored_count();
         for change in changes.into_values() {
             match change {
                 DeltaChange::Delete { id } => {
@@ -565,6 +796,27 @@ struct MessageRound {
     folder_id: String,
     delta_link: String,
     changes: BTreeMap<String, DeltaChange<RemoteMessage>>,
+}
+
+#[derive(Debug, Default)]
+struct LocalFlagPlan {
+    flag_updates: Vec<PlannedFlagUpdate>,
+    moved: usize,
+    missing: usize,
+    duplicates: usize,
+    edited: usize,
+}
+
+impl LocalFlagPlan {
+    fn get_ignored_count(&self) -> usize {
+        self.moved + self.missing + self.duplicates + self.edited
+    }
+}
+
+#[derive(Debug)]
+struct PlannedFlagUpdate {
+    operation: PendingFlagOperation,
+    needs_journal: bool,
 }
 
 #[derive(Debug)]
