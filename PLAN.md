@@ -256,7 +256,9 @@ Every phase follows red-green-refactor: write behavior tests first, confirm they
      remaining cloud-wins conflict handling.
 
 6. **Sending and release hardening**
-   - Implement RFC parsing, recipient safety, MIME Graph sending, sendmail exit codes, multi-account behavior, documentation, sample configuration, and recovery guidance.
+   - RFC parsing, recipient safety, MIME Graph sending, sendmail exit codes,
+     multi-account behavior, and operator documentation are implemented.
+   - Finish release packaging, recovery guidance, and the opt-in live smoke test.
 
 ## Test and Acceptance Plan
 

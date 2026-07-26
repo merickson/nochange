@@ -1,6 +1,7 @@
 use nochange::config::ConfigError;
 use nochange::error::{AppError, ExitCode};
 use nochange::init::InitError;
+use nochange::send::SendError;
 use nochange::sync::SyncError;
 
 #[test]
@@ -27,6 +28,39 @@ fn classifies_application_errors_with_stable_exit_codes() {
             AppError::Software("internal failure".into()),
             ExitCode::Software,
         ),
+        (
+            AppError::from(SendError::InvalidMessage),
+            ExitCode::DataError,
+        ),
+        (
+            AppError::from(SendError::from(nochange::graph::GraphError::RetryExhausted)),
+            ExitCode::TemporaryFailure,
+        ),
+        (
+            AppError::from(SendError::from(
+                nochange::graph::GraphError::SubmissionUnknown,
+            )),
+            ExitCode::TemporaryFailure,
+        ),
+        (
+            AppError::from(SendError::from(nochange::graph::GraphError::Response {
+                status: 403,
+                code: None,
+                request_id: None,
+            })),
+            ExitCode::Unavailable,
+        ),
+        (
+            AppError::from(SendError::from(
+                nochange::graph::GraphError::UnexpectedSendStatus(200),
+            )),
+            ExitCode::Software,
+        ),
+        (
+            AppError::from(SendError::IdentityMismatch),
+            ExitCode::Unavailable,
+        ),
+        (AppError::from(SendError::Spool), ExitCode::Software),
     ];
 
     for (error, expected) in cases {

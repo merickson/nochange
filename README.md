@@ -9,7 +9,8 @@ The Graph-based rewrite is under active development. `nochange init`
 authenticates and verifies the configured Microsoft 365 identity, and
 `nochange sync` now performs incremental cloud-to-local synchronization.
 Local read/follow-up flags, managed-folder moves, trash, and permanent deletion
-from Deleted Items synchronize back to Graph. Sending is not operational yet.
+from Deleted Items synchronize back to Graph. Outbound RFC messages can be
+submitted through a sendmail-compatible command.
 
 ## Build
 
@@ -212,6 +213,26 @@ printf 'From: myuser@contoso.com\nTo: recipient@contoso.com\nSubject: Test\n\nHe
 
 The Graph API returning `202 Accepted` means Microsoft accepted the message for
 processing; it does not prove final delivery.
+
+When exactly one account is configured, `send` infers it; otherwise `-a` is
+required. `From`, optional `Sender`, and optional `-f` must all name that
+account's configured `user` address. Aliases and delegated send-as are not
+supported yet.
+
+With `-t`, recipients are taken from the union of `To`, `Cc`, `Bcc`, and the
+command line. Without `-t`, at least one command-line recipient is required and
+every header recipient must also appear on the command line. Command-line
+recipients absent from the headers are added as `Bcc` before submission. The
+message must include a valid header/body separator. `-i` and `-oi` are accepted
+compatibility no-ops; a line containing only `.` is never treated specially.
+
+Message validation retains only the bounded header block in memory. The input
+and its base64 Graph payload are streamed through secure temporary files, and
+unrelated MIME headers, attachments, transfer encodings, and body bytes are
+not reserialized. An explicit throttling or transient Graph rejection is
+retried. A network failure after submission begins reports `EX_TEMPFAIL` with
+an unknown-result warning and is not automatically replayed, because Graph may
+already have accepted the message and a replay could create a duplicate.
 
 ## Safety model
 

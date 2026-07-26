@@ -3,7 +3,7 @@
 use crate::auth::{
     EntraEndpoints, EntraTokenExchange, KeyringCredentialStore, SystemBrowserLauncher, TokenManager,
 };
-use crate::cli::{Cli, Command, InitArgs, SyncArgs};
+use crate::cli::{Cli, Command, InitArgs, SendArgs, SyncArgs};
 use crate::config::{AccountSelection, AppConfig, AppPaths, ConfigError};
 use crate::error::AppError;
 use crate::graph::{GraphError, GraphTransport, TokioSleeper};
@@ -12,6 +12,7 @@ use crate::init::{
     ProfileVerifier,
 };
 use crate::maildir::MaildirStore;
+use crate::send::{SendError, SendOptions, prepare_message};
 use crate::state::{AccountLock, StateDatabase, StateError, get_account_lock_path};
 use crate::sync::{
     CloudSynchronizer, LocalLocationActionKind, SyncActionKind, SyncError, SyncProgress,
@@ -32,8 +33,85 @@ pub async fn run(cli: Cli) -> Result<(), AppError> {
     match command {
         Command::Init(arguments) => run_init(config.as_deref(), &arguments).await,
         Command::Sync(arguments) => run_sync(config.as_deref(), &arguments, verbose).await,
-        Command::Send(_) => Ok(()),
+        Command::Send(arguments) => run_send(config.as_deref(), &arguments).await,
     }
+}
+
+async fn run_send(config_override: Option<&Path>, arguments: &SendArgs) -> Result<(), AppError> {
+    let paths = AppPaths::discover()?;
+    let config_path = config_override.unwrap_or(&paths.config_file);
+    let home = BaseDirs::new().ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    let config = AppConfig::load_from(config_path, home.home_dir())?;
+    let account = match arguments.account.as_deref() {
+        Some(name) => config
+            .get_selected_accounts(AccountSelection::Named(name))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Software("selected account disappeared".into()))?,
+        None if config.account_names().len() == 1 => config
+            .get_selected_accounts(AccountSelection::All)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Software("configured account disappeared".into()))?,
+        None => {
+            return Err(AppError::Usage(
+                "multiple accounts are configured; select one with -a ACCOUNT".into(),
+            ));
+        }
+    };
+    let configured_sender = account.user.clone();
+    let envelope_sender = arguments.from.clone();
+    let read_recipients_from_headers = arguments.read_recipients_from_headers;
+    let envelope_recipients = arguments.recipients.clone();
+    let message = tokio::task::spawn_blocking(move || {
+        prepare_message(
+            std::io::stdin().lock(),
+            &SendOptions {
+                configured_sender: &configured_sender,
+                envelope_sender: envelope_sender.as_deref(),
+                read_recipients_from_headers,
+                envelope_recipients: &envelope_recipients,
+            },
+        )
+    })
+    .await
+    .map_err(|_| AppError::Software("message preparation task failed".into()))??;
+
+    let endpoints = EntraEndpoints::build(&account.tenant)
+        .map_err(GraphError::from)
+        .map_err(SendError::from)?;
+    let exchange = Arc::new(
+        EntraTokenExchange::build(&account.client_id, &endpoints)
+            .map_err(GraphError::from)
+            .map_err(SendError::from)?,
+    );
+    let tokens = Arc::new(TokenManager::new(
+        account.name.clone(),
+        Arc::new(KeyringCredentialStore),
+        exchange,
+    ));
+    let access_token = tokens
+        .get_access_token(false)
+        .await
+        .map_err(GraphError::from)
+        .map_err(SendError::from)?;
+    let identity = GraphProfileVerifier
+        .get_profile(&access_token)
+        .await
+        .map_err(SendError::from)?;
+    if !identity
+        .user_principal_name
+        .eq_ignore_ascii_case(&account.user)
+    {
+        return Err(SendError::IdentityMismatch.into());
+    }
+    let graph = GraphTransport::build(tokens, Arc::new(TokioSleeper)).map_err(SendError::from)?;
+    graph
+        .send_mime_file(message.get_encoded_path())
+        .await
+        .map_err(SendError::from)?;
+    eprintln!("nochange: message accepted for processing");
+    Ok(())
 }
 
 async fn run_init(config_override: Option<&Path>, arguments: &InitArgs) -> Result<(), AppError> {

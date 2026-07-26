@@ -250,6 +250,86 @@ where
         self.download_to(&url, destination).await
     }
 
+    /// Stream a prepared base64 MIME file to Graph's send-mail endpoint.
+    ///
+    /// Explicit rejection responses are retried according to the bounded
+    /// transport policy. A transport failure after the POST begins is not
+    /// replayed because Graph may already have accepted the message.
+    pub async fn send_mime_file(&self, payload: &std::path::Path) -> Result<(), GraphError> {
+        let url = GraphUrl::build("/me/sendMail")?;
+        self.send_mime_file_to(&url, payload).await
+    }
+
+    async fn send_mime_file_to(
+        &self,
+        url: &GraphUrl,
+        payload: &std::path::Path,
+    ) -> Result<(), GraphError> {
+        let mut force_refresh = false;
+        let mut refreshed_after_unauthorized = false;
+        let mut retry_number = 0;
+        let mut total_delay = Duration::ZERO;
+        loop {
+            let access_token = match self.token_provider.get_access_token(force_refresh).await {
+                Ok(access_token) => access_token,
+                Err(AuthError::TokenRequest) => {
+                    self.sleep_before_transport_retry(&mut retry_number, &mut total_delay)
+                        .await?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            force_refresh = false;
+            let input = tokio::fs::File::open(payload)
+                .await
+                .map_err(|_| GraphError::InputFile)?;
+            let response = self
+                .http_client
+                .post(url.as_str())
+                .bearer_auth(access_token.expose_secret())
+                .header(reqwest::header::CONTENT_TYPE, "text/plain")
+                .body(reqwest::Body::from(input))
+                .send()
+                .await
+                .map_err(|_| GraphError::SubmissionUnknown)?;
+            let status = response.status().as_u16();
+            if status == 401 && !refreshed_after_unauthorized {
+                refreshed_after_unauthorized = true;
+                force_refresh = true;
+                continue;
+            }
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok());
+            if let Some(delay) = self.retry_policy.get_retry_delay(
+                status,
+                retry_after,
+                retry_number,
+                total_delay,
+                SystemTime::now(),
+            )? {
+                self.sleeper.sleep(delay).await;
+                total_delay += delay;
+                retry_number += 1;
+                continue;
+            }
+            if status == 202 {
+                return Ok(());
+            }
+            if response.status().is_success() {
+                return Err(GraphError::UnexpectedSendStatus(status));
+            }
+            let request_id = response
+                .headers()
+                .get("request-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(get_safe_diagnostic_value);
+            let body = response.bytes().await.map_err(|_| GraphError::Request)?;
+            return Err(build_response_error(status, request_id, &body));
+        }
+    }
+
     /// Update the supported read and follow-up flags for one immutable message.
     pub async fn update_message_flags(
         &self,
@@ -750,6 +830,15 @@ pub enum GraphError {
     /// A MIME destination could not be created, written, or synchronized.
     #[error("could not write the Microsoft Graph response to its destination file")]
     OutputFile,
+    /// A prepared outbound MIME file could not be opened.
+    #[error("could not read the prepared message payload")]
+    InputFile,
+    /// Graph returned a successful status other than the required acceptance.
+    #[error("Microsoft Graph returned unexpected send status HTTP {0}")]
+    UnexpectedSendStatus(u16),
+    /// The connection failed after submission began, so acceptance is unknown.
+    #[error("message submission result is unknown; retrying may send a duplicate")]
+    SubmissionUnknown,
     /// Graph rejected a request permanently.
     #[error("Microsoft Graph request failed with HTTP {status}")]
     Response {
@@ -1038,7 +1127,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task::JoinHandle;
-    use wiremock::matchers::{body_json, header, header_regex, method, path};
+    use wiremock::matchers::{body_json, body_string, header, header_regex, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[derive(Default)]
@@ -1092,6 +1181,12 @@ mod tests {
         delay: Duration,
     }
 
+    struct FirstResponseThenAccepted {
+        calls: AtomicUsize,
+        first_status: u16,
+        retry_after: Option<&'static str>,
+    }
+
     impl Respond for FirstDelayedResponseThenSuccess {
         fn respond(&self, _request: &Request) -> ResponseTemplate {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1101,6 +1196,21 @@ mod tests {
             } else {
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"id": "retried-user-id"}))
+            }
+        }
+    }
+
+    impl Respond for FirstResponseThenAccepted {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let response = ResponseTemplate::new(self.first_status);
+                if let Some(retry_after) = self.retry_after {
+                    response.insert_header("Retry-After", retry_after)
+                } else {
+                    response
+                }
+            } else {
+                ResponseTemplate::new(202)
             }
         }
     }
@@ -1431,6 +1541,224 @@ mod tests {
         assert_eq!(
             *sleeper.delays.lock().expect("delays should be readable"),
             [Duration::from_secs(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_base64_mime_to_sendmail_and_requires_accepted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .and(header("Content-Type", "text/plain"))
+            .and(body_string(
+                "RnJvbTogc2VuZGVyQGV4YW1wbGUuY29tDQoNCkJvZHkNCg==",
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let transport = build_test_transport(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::new(RecordingSleeper::default()),
+            RetryPolicy::default(),
+        );
+        let mut payload =
+            tempfile::NamedTempFile::new().expect("temporary encoded message should be created");
+        std::io::Write::write_all(
+            &mut payload,
+            b"RnJvbTogc2VuZGVyQGV4YW1wbGUuY29tDQoNCkJvZHkNCg==",
+        )
+        .expect("encoded message should be written");
+
+        transport
+            .send_mime_file_to(
+                &build_test_url(&server, "/v1.0/me/sendMail"),
+                payload.path(),
+            )
+            .await
+            .expect("202 should accept a streamed MIME message");
+
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/unexpected"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            transport
+                .send_mime_file_to(
+                    &build_test_url(&server, "/v1.0/me/unexpected"),
+                    payload.path(),
+                )
+                .await,
+            Err(GraphError::UnexpectedSendStatus(200))
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshes_sendmail_authentication_and_returns_safe_rejections() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .respond_with(FirstResponseThenAccepted {
+                calls: AtomicUsize::new(0),
+                first_status: 401,
+                retry_after: None,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let tokens = Arc::new(FakeTokenProvider::default());
+        let transport = build_test_transport(
+            Arc::clone(&tokens),
+            Arc::new(RecordingSleeper::default()),
+            RetryPolicy::default(),
+        );
+        let mut payload =
+            tempfile::NamedTempFile::new().expect("temporary encoded message should be created");
+        std::io::Write::write_all(&mut payload, b"cGF5bG9hZA==")
+            .expect("encoded message should be written");
+
+        transport
+            .send_mime_file_to(
+                &build_test_url(&server, "/v1.0/me/sendMail"),
+                payload.path(),
+            )
+            .await
+            .expect("401 should refresh once before accepted submission");
+        assert_eq!(
+            *tokens
+                .forced_refreshes
+                .lock()
+                .expect("token calls should be readable"),
+            [false, true]
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/forbidden"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("request-id", "send-request-123")
+                    .set_body_json(serde_json::json!({
+                        "error": {
+                            "code": "ErrorAccessDenied",
+                            "message": "message-content-must-not-leak"
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = transport
+            .send_mime_file_to(
+                &build_test_url(&server, "/v1.0/me/forbidden"),
+                payload.path(),
+            )
+            .await
+            .expect_err("403 should be returned without a replay");
+
+        assert_eq!(
+            error,
+            GraphError::Response {
+                status: 403,
+                code: Some("ErrorAccessDenied".into()),
+                request_id: Some("send-request-123".into()),
+            }
+        );
+        assert!(!format!("{error:?}").contains("message-content-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn retries_rejected_sendmail_responses_but_not_ambiguous_timeouts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .respond_with(FirstResponseThenAccepted {
+                calls: AtomicUsize::new(0),
+                first_status: 429,
+                retry_after: Some("2"),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let transport = build_test_transport(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::clone(&sleeper),
+            RetryPolicy::default(),
+        );
+        let mut payload =
+            tempfile::NamedTempFile::new().expect("temporary encoded message should be created");
+        std::io::Write::write_all(&mut payload, b"cGF5bG9hZA==")
+            .expect("encoded message should be written");
+
+        transport
+            .send_mime_file_to(
+                &build_test_url(&server, "/v1.0/me/sendMail"),
+                payload.path(),
+            )
+            .await
+            .expect("an explicit 429 rejection should be retried");
+        assert_eq!(
+            *sleeper.delays.lock().expect("delays should be readable"),
+            [Duration::from_secs(2)]
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/token-retry"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let token_provider = Arc::new(FlakyTokenProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let token_sleeper = Arc::new(RecordingSleeper::default());
+        let token_transport = GraphTransport::build_for_test(
+            Arc::clone(&token_provider),
+            Arc::clone(&token_sleeper),
+            RetryPolicy::default(),
+        )
+        .expect("token retry transport should build");
+        token_transport
+            .send_mime_file_to(
+                &build_test_url(&server, "/v1.0/me/token-retry"),
+                payload.path(),
+            )
+            .await
+            .expect("a transient token request failure should retry before submission");
+        assert_eq!(token_provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *token_sleeper
+                .delays
+                .lock()
+                .expect("token delays should be readable"),
+            [Duration::from_secs(1)]
+        );
+
+        let timeout_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_millis(50)))
+            .expect(1)
+            .mount(&timeout_server)
+            .await;
+        let timeout_transport = GraphTransport::build_for_test_with_timeout(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::new(RecordingSleeper::default()),
+            RetryPolicy::default(),
+            Duration::from_millis(10),
+        )
+        .expect("timeout transport should build");
+
+        assert_eq!(
+            timeout_transport
+                .send_mime_file_to(
+                    &build_test_url(&timeout_server, "/v1.0/me/sendMail"),
+                    payload.path(),
+                )
+                .await,
+            Err(GraphError::SubmissionUnknown)
         );
     }
 

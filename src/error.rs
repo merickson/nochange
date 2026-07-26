@@ -2,6 +2,7 @@
 
 use crate::config::ConfigError;
 use crate::init::InitError;
+use crate::send::SendError;
 use crate::sync::SyncError;
 use thiserror::Error;
 
@@ -46,6 +47,10 @@ pub enum AppError {
     #[error(transparent)]
     Synchronization(#[from] SyncError),
 
+    /// Outbound message validation or submission failed.
+    #[error(transparent)]
+    Sending(#[from] SendError),
+
     /// One or more accounts failed while later accounts continued.
     #[error("{0}")]
     Temporary(String),
@@ -61,11 +66,12 @@ pub enum AppError {
 
 impl AppError {
     /// Return the stable process classification for this error.
-    pub const fn get_exit_code(&self) -> ExitCode {
+    pub fn get_exit_code(&self) -> ExitCode {
         match self {
             Self::Configuration(_) => ExitCode::Configuration,
             Self::Initialization(_) => ExitCode::Unavailable,
             Self::Synchronization(_) | Self::Temporary(_) => ExitCode::TemporaryFailure,
+            Self::Sending(error) => error.get_exit_code(),
             Self::Usage(_) => ExitCode::Usage,
             Self::Software(_) => ExitCode::Software,
         }

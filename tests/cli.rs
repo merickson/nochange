@@ -216,3 +216,93 @@ fn sync_rejects_an_unknown_account_before_accessing_credentials() {
         .code(78)
         .stderr(predicate::str::contains("unknown account 'missing'"));
 }
+
+#[test]
+fn send_rejects_invalid_message_data_before_accessing_credentials() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let config = temp.path().join("nochange.conf");
+    fs::write(
+        &config,
+        format!(
+            "[global]\naccounts = work\n[work]\nmaildir = {}\nuser = me@example.com\nclientid = client-id\n",
+            temp.path().join("mail").display()
+        ),
+    )
+    .expect("configuration should be writable");
+    let mut command = Command::cargo_bin("nochange").expect("binary should build");
+
+    command
+        .args([
+            "--config",
+            config.to_str().expect("path should be UTF-8"),
+            "send",
+            "-a",
+            "work",
+            "-t",
+        ])
+        .write_stdin("From: me@example.com\nTo: person@example.com\nmissing separator")
+        .assert()
+        .code(65)
+        .stderr(predicate::str::contains("not a valid RFC message"));
+}
+
+#[test]
+fn send_requires_account_selection_when_multiple_accounts_are_configured() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let config = temp.path().join("nochange.conf");
+    fs::write(
+        &config,
+        format!(
+            "[global]\naccounts = one, two\n\
+[one]\nmaildir = {}\nuser = one@example.com\nclientid = client-id\n\
+[two]\nmaildir = {}\nuser = two@example.com\nclientid = client-id\n",
+            temp.path().join("one").display(),
+            temp.path().join("two").display(),
+        ),
+    )
+    .expect("configuration should be writable");
+    let mut command = Command::cargo_bin("nochange").expect("binary should build");
+
+    command
+        .args([
+            "--config",
+            config.to_str().expect("path should be UTF-8"),
+            "send",
+            "-t",
+        ])
+        .write_stdin("From: one@example.com\nTo: person@example.com\n\nBody\n")
+        .assert()
+        .code(64)
+        .stderr(predicate::str::contains(
+            "multiple accounts are configured; select one with -a",
+        ));
+}
+
+#[test]
+fn send_rejects_an_unknown_account_before_accessing_credentials() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let config = temp.path().join("nochange.conf");
+    fs::write(
+        &config,
+        format!(
+            "[global]\naccounts = work\n[work]\nmaildir = {}\nuser = me@example.com\nclientid = client-id\n",
+            temp.path().join("mail").display()
+        ),
+    )
+    .expect("configuration should be writable");
+    let mut command = Command::cargo_bin("nochange").expect("binary should build");
+
+    command
+        .args([
+            "--config",
+            config.to_str().expect("path should be UTF-8"),
+            "send",
+            "-a",
+            "missing",
+            "-t",
+        ])
+        .write_stdin("From: me@example.com\nTo: person@example.com\n\nBody\n")
+        .assert()
+        .code(78)
+        .stderr(predicate::str::contains("unknown account 'missing'"));
+}
