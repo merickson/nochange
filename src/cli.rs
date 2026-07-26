@@ -67,7 +67,7 @@ pub struct SendArgs {
     #[arg(short = 'a', value_name = "ACCOUNT")]
     pub account: Option<String>,
 
-    /// Set and validate the envelope sender.
+    /// Accepted sendmail compatibility option; the address is ignored.
     #[arg(short = 'f', value_name = "ADDRESS")]
     pub from: Option<String>,
 
@@ -79,9 +79,9 @@ pub struct SendArgs {
     #[arg(short = 'i', action = ArgAction::SetTrue)]
     pub ignore_dot: bool,
 
-    /// Hidden prefix that allows Clap to recognize the grouped `-oi` spelling.
-    #[arg(short = 'o', action = ArgAction::SetTrue, requires = "ignore_dot", hide = true)]
-    ignore_dot_prefix: bool,
+    /// Accepted sendmail compatibility option with no effect.
+    #[arg(short = 'o', action = ArgAction::SetTrue, hide = true)]
+    ignored_option: bool,
 
     /// Envelope recipients.
     #[arg(value_name = "RECIPIENT", trailing_var_arg = true)]

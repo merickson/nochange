@@ -197,7 +197,7 @@ nochange [--config PATH] [--verbose] <COMMAND>
 
 nochange init [--account NAME] [--device-code]
 nochange sync [--account NAME] [--dry-run] [--no-fsync]
-nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-i|-oi] [--] [RECIPIENT...]
+nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-o] [-i] [--] [RECIPIENT...]
 ```
 
 `init` authenticates and verifies the mailbox identity. `sync --dry-run`
@@ -212,10 +212,14 @@ printf 'From: myuser@contoso.com\nTo: recipient@contoso.com\nSubject: Test\n\nHe
 ```
 
 The Graph API returning `202 Accepted` means Microsoft accepted the message for
-processing; it does not prove final delivery.
+processing; it does not prove final delivery. Successful sends produce no
+terminal output; validation or submission failures are written to standard
+error and use the documented sendmail-compatible exit codes.
 
-When exactly one account is configured, `send` infers it; otherwise `-a` is
-required. `From`, optional `Sender`, and optional `-f` must all name that
+Without `-a`, `send` selects the unique configured account whose `user`
+matches the message's `From` and optional `Sender` address case-insensitively.
+If no account matches, sending is rejected; if multiple accounts use that same
+address, `-a` is required. `From` and optional `Sender` must name the selected
 account's configured `user` address. Aliases and delegated send-as are not
 supported yet.
 
@@ -223,8 +227,10 @@ With `-t`, recipients are taken from the union of `To`, `Cc`, `Bcc`, and the
 command line. Without `-t`, at least one command-line recipient is required and
 every header recipient must also appear on the command line. Command-line
 recipients absent from the headers are added as `Bcc` before submission. The
-message must include a valid header/body separator. `-i` and `-oi` are accepted
-compatibility no-ops; a line containing only `.` is never treated specially.
+message must include a valid header/body separator. `-o`, `-i`, grouped `-oi`,
+and `-f ADDRESS` are accepted compatibility no-ops. The `-f` address does not
+affect account or sender selection, and a line containing only `.` is never
+treated specially.
 
 Message validation retains only the bounded header block in memory. The input
 and its base64 Graph payload are streamed through secure temporary files, and

@@ -18,12 +18,57 @@ const MAX_HEADER_BYTES: usize = 1024 * 1024;
 pub struct SendOptions<'a> {
     /// Microsoft 365 mailbox allowed to send the message.
     pub configured_sender: &'a str,
-    /// Optional `-f` envelope sender.
-    pub envelope_sender: Option<&'a str>,
     /// Whether recipients in `To`, `Cc`, and `Bcc` authorize delivery.
     pub read_recipients_from_headers: bool,
     /// Recipient arguments supplied after the send command's options.
     pub envelope_recipients: &'a [String],
+}
+
+/// One complete input message retained on disk before account selection.
+pub struct SpooledMessage {
+    original: NamedTempFile,
+    header_block: Vec<u8>,
+    separator: Vec<u8>,
+    sender: String,
+}
+
+impl SpooledMessage {
+    /// Return the unique address established by `From` and optional `Sender`.
+    pub fn get_sender_address(&self) -> &str {
+        &self.sender
+    }
+
+    /// Validate recipients for the selected account and encode the Graph payload.
+    pub fn prepare(mut self, options: &SendOptions<'_>) -> Result<PreparedMessage, SendError> {
+        let parseable_headers = get_parseable_headers(&self.header_block, &self.separator);
+        let (headers, _) =
+            mailparse::parse_headers(&parseable_headers).map_err(|_| SendError::InvalidMessage)?;
+        validate_sender(&headers, options)?;
+        let missing_recipients = get_missing_header_recipients(&headers, options)?;
+
+        self.original
+            .as_file_mut()
+            .seek(SeekFrom::Start(
+                (self.header_block.len() + self.separator.len()) as u64,
+            ))
+            .map_err(|_| SendError::Spool)?;
+        let mut encoded = NamedTempFile::new().map_err(|_| SendError::Spool)?;
+        {
+            let mut encoder = base64::write::EncoderWriter::new(encoded.as_file_mut(), &STANDARD);
+            encoder
+                .write_all(&self.header_block)
+                .map_err(|_| SendError::Spool)?;
+            write_bcc_headers(&mut encoder, &missing_recipients, &self.separator)?;
+            encoder
+                .write_all(&self.separator)
+                .map_err(|_| SendError::Spool)?;
+            std::io::copy(self.original.as_file_mut(), &mut encoder)
+                .map_err(|_| SendError::Spool)?;
+            encoder.finish().map_err(|_| SendError::Spool)?;
+        }
+        encoded.flush().map_err(|_| SendError::Spool)?;
+        Ok(PreparedMessage { encoded })
+    }
 }
 
 /// A validated message encoded for Graph and retained in a secure temporary file.
@@ -47,6 +92,9 @@ pub enum SendError {
     /// The message or envelope sender did not uniquely match the configured mailbox.
     #[error("message sender must uniquely match the configured account")]
     InvalidSender,
+    /// No configured account owns the message sender address.
+    #[error("message sender does not match a configured account")]
+    UnconfiguredSender,
     /// A recipient field or argument did not contain a valid mailbox.
     #[error("message contains an invalid recipient address")]
     InvalidRecipient,
@@ -75,6 +123,7 @@ impl SendError {
         match self {
             Self::InvalidMessage
             | Self::InvalidSender
+            | Self::UnconfiguredSender
             | Self::InvalidRecipient
             | Self::NoRecipients
             | Self::HeaderRecipientOutsideEnvelope => ExitCode::DataError,
@@ -122,42 +171,39 @@ fn get_graph_exit_code(error: &GraphError) -> ExitCode {
 /// is not already represented in the headers, one `Bcc` header is inserted
 /// immediately before the original header/body separator.
 pub fn prepare_message<R: Read>(
-    mut input: R,
+    input: R,
     options: &SendOptions<'_>,
 ) -> Result<PreparedMessage, SendError> {
+    spool_message(input)?.prepare(options)
+}
+
+/// Stream one complete message to disk and extract its consistent sender.
+///
+/// This phase permits account selection without retaining an unbounded message
+/// in memory or performing any authentication or network operations.
+pub fn spool_message<R: Read>(mut input: R) -> Result<SpooledMessage, SendError> {
     let mut original = NamedTempFile::new().map_err(|_| SendError::Spool)?;
     let (header_block, separator) = spool_through_headers(&mut input, &mut original)?;
     std::io::copy(&mut input, &mut original).map_err(|_| SendError::Spool)?;
     original.flush().map_err(|_| SendError::Spool)?;
 
-    let mut parseable_headers = header_block.clone();
-    parseable_headers.extend_from_slice(&separator);
+    let parseable_headers = get_parseable_headers(&header_block, &separator);
     let (headers, _) =
         mailparse::parse_headers(&parseable_headers).map_err(|_| SendError::InvalidMessage)?;
-    validate_sender(&headers, options)?;
-    let missing_recipients = get_missing_header_recipients(&headers, options)?;
+    let sender = get_consistent_sender(&headers)?;
+    Ok(SpooledMessage {
+        original,
+        header_block,
+        separator,
+        sender,
+    })
+}
 
-    original
-        .as_file_mut()
-        .seek(SeekFrom::Start(
-            (header_block.len() + separator.len()) as u64,
-        ))
-        .map_err(|_| SendError::Spool)?;
-    let mut encoded = NamedTempFile::new().map_err(|_| SendError::Spool)?;
-    {
-        let mut encoder = base64::write::EncoderWriter::new(encoded.as_file_mut(), &STANDARD);
-        encoder
-            .write_all(&header_block)
-            .map_err(|_| SendError::Spool)?;
-        write_bcc_headers(&mut encoder, &missing_recipients, &separator)?;
-        encoder
-            .write_all(&separator)
-            .map_err(|_| SendError::Spool)?;
-        std::io::copy(original.as_file_mut(), &mut encoder).map_err(|_| SendError::Spool)?;
-        encoder.finish().map_err(|_| SendError::Spool)?;
-    }
-    encoded.flush().map_err(|_| SendError::Spool)?;
-    Ok(PreparedMessage { encoded })
+fn get_parseable_headers(header_block: &[u8], separator: &[u8]) -> Vec<u8> {
+    let mut parseable_headers = Vec::with_capacity(header_block.len() + separator.len());
+    parseable_headers.extend_from_slice(header_block);
+    parseable_headers.extend_from_slice(separator);
+    parseable_headers
 }
 
 fn spool_through_headers<R: Read, W: Write>(
@@ -194,23 +240,21 @@ fn spool_through_headers<R: Read, W: Write>(
 }
 
 fn validate_sender(headers: &[MailHeader<'_>], options: &SendOptions<'_>) -> Result<(), SendError> {
-    let from = get_unique_header_mailbox(headers, "From")?.ok_or(SendError::InvalidSender)?;
-    if !from.eq_ignore_ascii_case(options.configured_sender) {
+    let sender = get_consistent_sender(headers)?;
+    if !sender.eq_ignore_ascii_case(options.configured_sender) {
         return Err(SendError::InvalidSender);
     }
+    Ok(())
+}
+
+fn get_consistent_sender(headers: &[MailHeader<'_>]) -> Result<String, SendError> {
+    let from = get_unique_header_mailbox(headers, "From")?.ok_or(SendError::InvalidSender)?;
     if let Some(sender) = get_unique_header_mailbox(headers, "Sender")?
-        && !sender.eq_ignore_ascii_case(options.configured_sender)
+        && !sender.eq_ignore_ascii_case(&from)
     {
         return Err(SendError::InvalidSender);
     }
-    if let Some(envelope_sender) = options.envelope_sender {
-        let envelope_sender =
-            get_single_mailbox(envelope_sender).map_err(|_| SendError::InvalidSender)?;
-        if !envelope_sender.eq_ignore_ascii_case(options.configured_sender) {
-            return Err(SendError::InvalidSender);
-        }
-    }
-    Ok(())
+    Ok(from)
 }
 
 fn get_unique_header_mailbox(

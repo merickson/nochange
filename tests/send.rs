@@ -1,6 +1,6 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use nochange::send::{SendError, SendOptions, prepare_message};
+use nochange::send::{SendError, SendOptions, prepare_message, spool_message};
 use std::fs;
 use std::io::{Cursor, Read};
 
@@ -10,6 +10,18 @@ fn get_decoded_message(message: &nochange::send::PreparedMessage) -> Vec<u8> {
     STANDARD
         .decode(encoded)
         .expect("prepared message should contain valid base64")
+}
+
+#[test]
+fn extracts_one_consistent_sender_from_a_spooled_message() {
+    let message = b"From: Sender <Sender@Example.com>\r\n\
+Sender: sender@example.com\r\n\
+To: person@example.com\r\n\r\nBody\r\n";
+
+    let spooled =
+        spool_message(Cursor::new(message)).expect("consistent sender headers should spool");
+
+    assert_eq!(spooled.get_sender_address(), "Sender@Example.com");
 }
 
 #[test]
@@ -23,7 +35,6 @@ Body bytes: \x00\xff\r\n";
     let recipients = vec!["person@example.com".to_owned()];
     let options = SendOptions {
         configured_sender: "sender@example.com",
-        envelope_sender: None,
         read_recipients_from_headers: false,
         envelope_recipients: &recipients,
     };
@@ -44,7 +55,6 @@ fn adds_missing_envelope_recipients_as_bcc_without_reserializing_the_message() {
     ];
     let options = SendOptions {
         configured_sender: "SENDER@example.com",
-        envelope_sender: Some("Sender@Example.Com"),
         read_recipients_from_headers: false,
         envelope_recipients: &recipients,
     };
@@ -70,7 +80,6 @@ Body\r\n";
     let recipients = vec!["THREE@example.com".to_owned(), "cli@example.com".to_owned()];
     let options = SendOptions {
         configured_sender: "sender@example.com",
-        envelope_sender: None,
         read_recipients_from_headers: true,
         envelope_recipients: &recipients,
     };
@@ -96,7 +105,6 @@ fn rejects_header_recipients_missing_from_the_envelope_without_t() {
     let recipients = vec!["cli@example.com".to_owned()];
     let options = SendOptions {
         configured_sender: "sender@example.com",
-        envelope_sender: None,
         read_recipients_from_headers: false,
         envelope_recipients: &recipients,
     };
@@ -110,33 +118,16 @@ fn rejects_header_recipients_missing_from_the_envelope_without_t() {
 #[test]
 fn rejects_missing_or_conflicting_senders() {
     let recipients = vec!["person@example.com".to_owned()];
-    let cases: &[(&[u8], Option<&str>)] = &[
-        (
-            b"To: person@example.com\r\n\r\nBody\r\n",
-            None,
-        ),
-        (
-            b"From: other@example.com\r\nTo: person@example.com\r\n\r\nBody\r\n",
-            None,
-        ),
-        (
-            b"From: sender@example.com\r\nSender: other@example.com\r\nTo: person@example.com\r\n\r\nBody\r\n",
-            None,
-        ),
-        (
-            b"From: sender@example.com\r\nTo: person@example.com\r\n\r\nBody\r\n",
-            Some("other@example.com"),
-        ),
-        (
-            b"From: one@example.com, two@example.com\r\nTo: person@example.com\r\n\r\nBody\r\n",
-            None,
-        ),
+    let cases: &[&[u8]] = &[
+        b"To: person@example.com\r\n\r\nBody\r\n",
+        b"From: other@example.com\r\nTo: person@example.com\r\n\r\nBody\r\n",
+        b"From: sender@example.com\r\nSender: other@example.com\r\nTo: person@example.com\r\n\r\nBody\r\n",
+        b"From: one@example.com, two@example.com\r\nTo: person@example.com\r\n\r\nBody\r\n",
     ];
 
-    for (message, envelope_sender) in cases {
+    for message in cases {
         let options = SendOptions {
             configured_sender: "sender@example.com",
-            envelope_sender: *envelope_sender,
             read_recipients_from_headers: false,
             envelope_recipients: &recipients,
         };
@@ -180,7 +171,6 @@ fn rejects_malformed_message_and_recipient_input() {
     for (message, recipients, read_headers) in cases {
         let options = SendOptions {
             configured_sender: "sender@example.com",
-            envelope_sender: None,
             read_recipients_from_headers: *read_headers,
             envelope_recipients: recipients,
         };
@@ -199,7 +189,6 @@ fn rejects_unbounded_headers_and_reports_input_read_failures_safely() {
     let recipients = vec!["person@example.com".to_owned()];
     let options = SendOptions {
         configured_sender: "sender@example.com",
-        envelope_sender: None,
         read_recipients_from_headers: false,
         envelope_recipients: &recipients,
     };

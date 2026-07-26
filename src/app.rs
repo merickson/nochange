@@ -12,7 +12,7 @@ use crate::init::{
     ProfileVerifier,
 };
 use crate::maildir::MaildirStore;
-use crate::send::{SendError, SendOptions, prepare_message};
+use crate::send::{SendError, SendOptions, spool_message};
 use crate::state::{AccountLock, StateDatabase, StateError, get_account_lock_path};
 use crate::sync::{
     CloudSynchronizer, LocalLocationActionKind, SyncActionKind, SyncError, SyncProgress,
@@ -42,37 +42,50 @@ async fn run_send(config_override: Option<&Path>, arguments: &SendArgs) -> Resul
     let config_path = config_override.unwrap_or(&paths.config_file);
     let home = BaseDirs::new().ok_or(ConfigError::HomeDirectoryUnavailable)?;
     let config = AppConfig::load_from(config_path, home.home_dir())?;
-    let account = match arguments.account.as_deref() {
-        Some(name) => config
-            .get_selected_accounts(AccountSelection::Named(name))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::Software("selected account disappeared".into()))?,
-        None if config.account_names().len() == 1 => config
+    let explicit_account = match arguments.account.as_deref() {
+        Some(name) => Some(
+            config
+                .get_selected_accounts(AccountSelection::Named(name))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::Software("selected account disappeared".into()))?,
+        ),
+        None => None,
+    };
+    let spooled = tokio::task::spawn_blocking(|| spool_message(std::io::stdin().lock()))
+        .await
+        .map_err(|_| AppError::Software("message spooling task failed".into()))??;
+    let account = if let Some(account) = explicit_account {
+        account
+    } else {
+        let matching = config
             .get_selected_accounts(AccountSelection::All)?
             .into_iter()
-            .next()
-            .ok_or_else(|| AppError::Software("configured account disappeared".into()))?,
-        None => {
-            return Err(AppError::Usage(
-                "multiple accounts are configured; select one with -a ACCOUNT".into(),
-            ));
+            .filter(|account| {
+                account
+                    .user
+                    .eq_ignore_ascii_case(spooled.get_sender_address())
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [] => return Err(SendError::UnconfiguredSender.into()),
+            [account] => *account,
+            _ => {
+                return Err(AppError::Usage(
+                    "multiple accounts match the message sender; select one with -a ACCOUNT".into(),
+                ));
+            }
         }
     };
     let configured_sender = account.user.clone();
-    let envelope_sender = arguments.from.clone();
     let read_recipients_from_headers = arguments.read_recipients_from_headers;
     let envelope_recipients = arguments.recipients.clone();
     let message = tokio::task::spawn_blocking(move || {
-        prepare_message(
-            std::io::stdin().lock(),
-            &SendOptions {
-                configured_sender: &configured_sender,
-                envelope_sender: envelope_sender.as_deref(),
-                read_recipients_from_headers,
-                envelope_recipients: &envelope_recipients,
-            },
-        )
+        spooled.prepare(&SendOptions {
+            configured_sender: &configured_sender,
+            read_recipients_from_headers,
+            envelope_recipients: &envelope_recipients,
+        })
     })
     .await
     .map_err(|_| AppError::Software("message preparation task failed".into()))??;
@@ -110,9 +123,12 @@ async fn run_send(config_override: Option<&Path>, arguments: &SendArgs) -> Resul
         .send_mime_file(message.get_encoded_path())
         .await
         .map_err(SendError::from)?;
-    eprintln!("nochange: message accepted for processing");
+    report_send_success(&mut std::io::stderr().lock());
     Ok(())
 }
+
+/// Preserve sendmail's silent-success contract at the terminal output boundary.
+fn report_send_success(_output: &mut dyn std::io::Write) {}
 
 async fn run_init(config_override: Option<&Path>, arguments: &InitArgs) -> Result<(), AppError> {
     let paths = AppPaths::discover()?;
@@ -464,8 +480,17 @@ fn show_sync_summary(account: &str, summary: SyncSummary, dry_run: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_safe_log_value, get_sync_progress_message};
+    use super::{get_safe_log_value, get_sync_progress_message, report_send_success};
     use crate::sync::{LocalLocationActionKind, SyncProgress};
+
+    #[test]
+    fn successful_send_produces_no_output() {
+        let mut output = Vec::new();
+
+        report_send_success(&mut output);
+
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn renders_normal_and_verbose_progress_at_the_expected_detail_levels() {

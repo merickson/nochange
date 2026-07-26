@@ -92,11 +92,11 @@ fn parses_sendmail_compatible_options_and_recipients() {
 }
 
 #[test]
-fn rejects_partial_sendmail_oi_option() {
-    let error = Cli::try_parse_from(["nochange", "send", "-o"])
-        .expect_err("-o alone is not part of the supported sendmail subset");
+fn accepts_standalone_ignored_sendmail_o_option() {
+    let cli = Cli::try_parse_from(["nochange", "send", "-o"])
+        .expect("standalone -o should be accepted as a compatibility no-op");
 
-    assert_eq!(error.exit_code(), 2);
+    assert!(matches!(cli.command, NochangeCommand::Send(_)));
 }
 
 #[test]
@@ -247,7 +247,41 @@ fn send_rejects_invalid_message_data_before_accessing_credentials() {
 }
 
 #[test]
-fn send_requires_account_selection_when_multiple_accounts_are_configured() {
+fn send_selects_an_account_from_the_from_header_before_recipient_validation() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let config = temp.path().join("nochange.conf");
+    fs::write(
+        &config,
+        format!(
+            "[global]\naccounts = one, two\n\
+[one]\nmaildir = {}\nuser = one@example.com\nclientid = client-id\n\
+[two]\nmaildir = {}\nuser = two@example.com\nclientid = client-id\n",
+            temp.path().join("one").display(),
+            temp.path().join("two").display(),
+        ),
+    )
+    .expect("configuration should be writable");
+    let mut command = Command::cargo_bin("nochange").expect("binary should build");
+
+    command
+        .args([
+            "--config",
+            config.to_str().expect("path should be UTF-8"),
+            "send",
+            "-o",
+            "-f",
+            "ignored@example.com",
+            "-i",
+            "-t",
+        ])
+        .write_stdin("From: one@example.com\nTo: malformed\n\nBody\n")
+        .assert()
+        .code(65)
+        .stderr(predicate::str::contains("invalid recipient address"));
+}
+
+#[test]
+fn send_rejects_a_sender_that_matches_no_configured_account() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let config = temp.path().join("nochange.conf");
     fs::write(
@@ -270,11 +304,43 @@ fn send_requires_account_selection_when_multiple_accounts_are_configured() {
             "send",
             "-t",
         ])
-        .write_stdin("From: one@example.com\nTo: person@example.com\n\nBody\n")
+        .write_stdin("From: other@example.com\nTo: person@example.com\n\nBody\n")
+        .assert()
+        .code(65)
+        .stderr(predicate::str::contains(
+            "message sender does not match a configured account",
+        ));
+}
+
+#[test]
+fn send_requires_an_explicit_account_when_sender_identity_is_ambiguous() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let config = temp.path().join("nochange.conf");
+    fs::write(
+        &config,
+        format!(
+            "[global]\naccounts = one, two\n\
+[one]\nmaildir = {}\nuser = shared@example.com\nclientid = client-id\n\
+[two]\nmaildir = {}\nuser = shared@example.com\nclientid = client-id\n",
+            temp.path().join("one").display(),
+            temp.path().join("two").display(),
+        ),
+    )
+    .expect("configuration should be writable");
+    let mut command = Command::cargo_bin("nochange").expect("binary should build");
+
+    command
+        .args([
+            "--config",
+            config.to_str().expect("path should be UTF-8"),
+            "send",
+            "-t",
+        ])
+        .write_stdin("From: shared@example.com\nTo: person@example.com\n\nBody\n")
         .assert()
         .code(64)
         .stderr(predicate::str::contains(
-            "multiple accounts are configured; select one with -a",
+            "multiple accounts match the message sender; select one with -a",
         ));
 }
 

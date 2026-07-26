@@ -77,7 +77,7 @@ nochange [--config PATH] [--verbose] <COMMAND>
 
 nochange init [--account NAME] [--device-code]
 nochange sync [--account NAME] [--dry-run]
-nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-i|-oi] [--] [RECIPIENT...]
+nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-o] [-i] [--] [RECIPIENT...]
 ```
 
 Behavior:
@@ -85,9 +85,14 @@ Behavior:
 - `init` validates configuration, obtains consent, verifies `/me`, initializes state, and creates selected Maildirs. It does not upload or delete messages.
 - `sync` processes all configured accounts serially unless one account is selected. Continue to later accounts after an account failure and return nonzero if any account failed.
 - `sync --dry-run` performs discovery and reconciliation planning but makes no Graph, Maildir, checkpoint, or journal mutations.
-- `send` reads one RFC message from stdin. `-i` and `-oi` are accepted no-ops for common sendmail callers.
-- Infer the send account only when exactly one account is configured; otherwise require `-a`.
+- `send` reads one RFC message from stdin. `-o`, `-i`, grouped `-oi`, and
+  `-f ADDRESS` are accepted no-ops for common sendmail callers.
+- Without `-a`, infer the unique configured account whose `user` matches the
+  message's consistent `From`/`Sender` identity; require `-a` when more than one
+  configured account uses that identity.
 - Map failures to sendmail-style `EX_USAGE`, `EX_DATAERR`, `EX_UNAVAILABLE`, `EX_SOFTWARE`, `EX_TEMPFAIL`, and `EX_CONFIG` exit codes.
+- Preserve sendmail's quiet-success convention: successful sends produce no
+  output, while failures are reported on standard error.
 
 Use `$XDG_CONFIG_HOME/nochange/nochange.conf`, normally `~/.config/nochange/nochange.conf`:
 
@@ -223,7 +228,9 @@ Sending rules:
 
 - Require syntactically valid RFC message input; update README examples to include at least a valid header/body separator.
 - Parse headers without normalizing or reserializing unrelated MIME content.
-- Require the MIME `From`/`Sender` and `-f`, when supplied, to match the configured account case-insensitively. Reject aliases and delegated sending in the first release.
+- Require the MIME `From`/`Sender` to match the configured account
+  case-insensitively. Accept `-f ADDRESS` without using it for sender or account
+  selection. Reject aliases and delegated sending in the first release.
 - With `-t`, send to the union of valid `To`, `Cc`, `Bcc`, and command-line recipients.
 - Without `-t`, require command-line recipients and reject any header recipient absent from that command-line set.
 - Add command-line recipients missing from visible headers as transient `Bcc` fields so Graph receives the intended envelope set.
@@ -272,7 +279,9 @@ Required coverage includes:
 - Schema creation, unknown versions, migrations, rollbacks, staged-run recovery, pending-operation replay, locking, and transaction failures.
 - Atomic Maildir delivery, placement in `new`/`cur`, sorted and preserved flags, rewritten filenames, folder encoding, duplicate keys, interrupted writes, and conflict uniqueness.
 - Idempotent initial/repeated sync; every remote create/update/delete/move/folder rename; every supported local flag/trash/move; untracked and edited files; ambiguous correlations; invalid delta recovery; and all conflict combinations.
-- RFC send validation, `-t`, CLI recipients, Bcc injection, sender validation, ignored `-i/-oi`, payload encoding, Graph acceptance/rejection, and multiple accounts.
+- RFC send validation, `-t`, CLI recipients, Bcc injection, sender validation,
+  ignored `-o`/`-f`/`-i` options, payload encoding, Graph
+  acceptance/rejection, and multiple accounts.
 
 Validation commands:
 
