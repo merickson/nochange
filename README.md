@@ -162,6 +162,10 @@ opaque Microsoft Graph delta links. A failed or interrupted round leaves its
 message checkpoint unchanged, so it can be replayed without re-downloading
 already committed versions.
 
+Maildir folder names preserve ordinary spaces, Unicode, and readable
+punctuation. Only hierarchy separators, ambiguous percent signs, control
+characters, and filesystem-unsafe characters are escaped.
+
 This phase synchronizes cloud-created, changed, moved, and deleted messages to
 Maildir, including the `S` (read) and `F` (flagged) flags. It does not yet push
 local flag, move, or trash changes back to Microsoft 365. If cloud state

@@ -157,15 +157,26 @@ impl MaildirStore {
             Some(self.preserve_conflict(&current, current_relative_path, maildir_key)?)
         };
         let mime_hash = get_file_hash(staging)?;
-        let destination_relative = get_message_relative_path(local_path, maildir_key, flags, &[]);
+        let preserved_flags = get_preserved_flags(&current)?;
+        let destination_relative =
+            get_message_relative_path(local_path, maildir_key, flags, &preserved_flags);
         let destination = self.get_safe_path(&destination_relative)?;
 
         if current_hash == mime_hash {
             fs::remove_file(staging)?;
-            let relative_path = self.set_flags(current_relative_path, flags)?;
+            if destination != current {
+                if destination.exists() {
+                    return Err(MaildirError::DestinationCollision {
+                        relative_path: destination_relative,
+                    });
+                }
+                fs::rename(&current, &destination)?;
+                sync_directory(current.parent(), self.fsync_enabled)?;
+                sync_directory(destination.parent(), self.fsync_enabled)?;
+            }
             return Ok(ReplacedMessage {
                 delivered: DeliveredMessage {
-                    relative_path,
+                    relative_path: destination_relative,
                     mime_hash,
                 },
                 conflict_path,
@@ -376,16 +387,23 @@ pub enum MaildirError {
 
 fn encode_folder_component(component: &str, folder_separator: char) -> String {
     let mut encoded = String::new();
-    for character in component.chars() {
-        let is_safe_ascii = character.is_ascii_alphanumeric()
-            || matches!(character, '-' | '_')
-            || (character == '.' && folder_separator != '.');
-        if !character.is_ascii() || (is_safe_ascii && character != folder_separator) {
-            encoded.push(character);
-        } else {
+    let mut characters = component.chars().peekable();
+    while let Some(character) = characters.next() {
+        let is_unsafe_ending = characters.peek().is_none() && matches!(character, ' ' | '.');
+        let requires_encoding = character == folder_separator
+            || character == '%'
+            || character.is_control()
+            || is_unsafe_ending
+            || matches!(
+                character,
+                '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+            );
+        if requires_encoding {
             let mut bytes = [0; 4];
             let value = character.encode_utf8(&mut bytes);
             encoded.push_str(&percent_encode(value.as_bytes(), NON_ALPHANUMERIC).to_string());
+        } else {
+            encoded.push(character);
         }
     }
     encoded
@@ -428,6 +446,19 @@ fn split_maildir_name(file_name: &str) -> (&str, &str) {
     file_name
         .split_once(":2,")
         .map_or((file_name, ""), |(key, flags)| (key, flags))
+}
+
+/// Return unsupported Maildir flags that cloud synchronization must preserve.
+fn get_preserved_flags(path: &Path) -> Result<Vec<char>, MaildirError> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(MaildirError::UnsafePath)?;
+    let (_, existing_flags) = split_maildir_name(file_name);
+    Ok(existing_flags
+        .chars()
+        .filter(|flag| matches!(flag, 'D' | 'P' | 'R'))
+        .collect())
 }
 
 fn get_file_hash(path: &Path) -> Result<String, MaildirError> {

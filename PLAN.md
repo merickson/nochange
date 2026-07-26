@@ -35,7 +35,8 @@ Use these crate families, selecting current compatible releases when implementat
 - `directories` for XDG/platform configuration and state paths.
 - `fs4` for per-account interprocess file locks.
 - `mail-parser` for RFC message and recipient parsing without implementing MIME parsing locally.
-- `percent-encoding`, `sha2`, and `hex` for reversible folder paths and deterministic Maildir keys.
+- `percent-encoding`, `sha2`, and `hex` for minimally escaped reversible folder
+  paths and deterministic Maildir keys.
 - `thiserror` for dedicated error types and `tracing` plus `tracing-subscriber` for diagnostics.
 - `backon` or an equivalently focused retry crate for bounded retries that honor Graph backoff headers.
 - `secrecy` and `zeroize` for values containing tokens while they are in memory.

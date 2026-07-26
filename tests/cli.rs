@@ -56,6 +56,14 @@ fn parses_sync_options() {
 }
 
 #[test]
+fn rejects_the_removed_folder_name_migration_command() {
+    let error = Cli::try_parse_from(["nochange", "migrate-folder-names"])
+        .expect_err("the one-shot migration command should no longer be available");
+
+    assert_eq!(error.exit_code(), 2);
+}
+
+#[test]
 fn parses_sendmail_compatible_options_and_recipients() {
     let cli = Cli::try_parse_from([
         "nochange",

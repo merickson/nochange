@@ -19,11 +19,20 @@ fn read_flagged_flags() -> MessageFlags {
 fn encodes_remote_folder_components_for_the_configured_separator() {
     assert_eq!(
         get_encoded_folder_path("Projects/One.Two/50% *", '.').expect("folder path should encode"),
-        "Projects.One%2ETwo.50%25%20%2A"
+        "Projects.One%2ETwo.50%25 %2A"
     );
     assert_eq!(
         get_encoded_folder_path("Réunions/正常", '.').expect("Unicode path should encode"),
         "Réunions.正常"
+    );
+    assert_eq!(
+        get_encoded_folder_path("Sent Items/Family & Friends (2026)", '.')
+            .expect("readable punctuation should remain"),
+        "Sent Items.Family & Friends (2026)"
+    );
+    assert_eq!(
+        get_encoded_folder_path("Trailing /Dot.", '_').expect("unsafe endings should encode"),
+        "Trailing%20_Dot%2E"
     );
     assert!(get_encoded_folder_path("", '.').is_err());
     assert!(get_encoded_folder_path("Inbox//Nested", '.').is_err());
@@ -267,6 +276,41 @@ fn atomically_replaces_a_clean_tracked_message() {
         b"updated bytes"
     );
     assert!(!temp.path().join(&original.relative_path).exists());
+}
+
+#[test]
+fn moves_identical_mime_to_its_new_remote_folder() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let store = MaildirStore::new(temp.path());
+    let original_staging = store
+        .prepare_download("Inbox", "message-key")
+        .expect("original download should prepare");
+    fs::write(&original_staging, b"unchanged bytes").expect("staging should be writable");
+    let original = store
+        .commit_download("Inbox", "message-key", unread_flags(), &original_staging)
+        .expect("original should commit");
+    let moved_staging = store
+        .prepare_download("Deleted Items", "message-key")
+        .expect("moved download should prepare");
+    fs::write(&moved_staging, b"unchanged bytes").expect("staging should be writable");
+
+    let moved = store
+        .replace_tracked(
+            &original.relative_path,
+            &original.mime_hash,
+            "Deleted Items",
+            "message-key",
+            unread_flags(),
+            &moved_staging,
+        )
+        .expect("identical MIME should move folders");
+
+    assert_eq!(
+        moved.delivered.relative_path,
+        "Deleted Items/new/message-key"
+    );
+    assert!(!temp.path().join(original.relative_path).exists());
+    assert!(temp.path().join("Deleted Items/new/message-key").is_file());
 }
 
 #[test]
