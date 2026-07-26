@@ -58,6 +58,14 @@ fn calculates_retry_after_and_exponential_delays() {
             .expect("missing header should use exponential backoff"),
         Some(Duration::from_secs(4))
     );
+    for status in [408, 500] {
+        assert_eq!(
+            policy
+                .get_retry_delay(status, None, 0, Duration::ZERO, now)
+                .expect("transient response should be retried"),
+            Some(Duration::from_secs(1))
+        );
+    }
     assert_eq!(
         policy
             .get_retry_delay(400, None, 0, Duration::ZERO, now)

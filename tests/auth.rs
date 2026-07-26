@@ -443,6 +443,52 @@ async fn exchanges_refresh_tokens_as_a_public_client() {
 }
 
 #[tokio::test]
+async fn distinguishes_transient_token_transport_failures_from_server_rejections() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "rejected"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let rejected = EntraTokenExchange::build("client-id", &build_test_endpoints(&server))
+        .expect("rejected exchange should build");
+
+    assert!(matches!(
+        rejected
+            .exchange_refresh_token(&SecretString::from("rejected-refresh"))
+            .await,
+        Err(AuthError::TokenExchange)
+    ));
+
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port should be reservable");
+    let address = listener.local_addr().expect("listener address should load");
+    drop(listener);
+    let unavailable_url =
+        url::Url::parse(&format!("http://{address}/token")).expect("token URL should be valid");
+    let unavailable = EntraTokenExchange::build(
+        "client-id",
+        &EntraEndpoints {
+            authorization: unavailable_url.clone(),
+            token: unavailable_url.clone(),
+            device_authorization: unavailable_url,
+        },
+    )
+    .expect("unavailable exchange should build");
+
+    assert!(matches!(
+        unavailable
+            .exchange_refresh_token(&SecretString::from("stored-refresh"))
+            .await,
+        Err(AuthError::TokenRequest)
+    ));
+}
+
+#[tokio::test]
 async fn exchanges_authorization_codes_with_the_original_pkce_verifier() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

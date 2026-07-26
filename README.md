@@ -222,16 +222,22 @@ verified callback state; device authorization is also supported by the auth
 module. Tokens, authorization codes, and message content must not appear in
 logs.
 
-Graph requests use explicit timeouts, reject redirects and non-v1.0 Graph
-links, request immutable Outlook IDs, retry bounded transient failures, and
-remove incomplete MIME downloads. Folder and message delta requests ask Graph
-for up to 1,000 changes per page and repeat that preference on continuation
-requests; Graph may return fewer. Synchronization uses deterministic Maildir
-keys, bounded four-at-a-time MIME transfers, serialized atomic Maildir delivery,
-SQLite-backed delta checkpoints, and cloud-wins conflict handling that
-preserves divergent local content. Local flag, move, trash, and delete
-mutations use a durable SQLite journal and are cleared only after Graph accepts
-them and their matching delta change is observed.
+Graph requests use explicit connect and two-minute request timeouts, reject
+redirects and non-v1.0 Graph links, and request immutable Outlook IDs. Bounded
+exponential retries cover throttling, transient HTTP responses, connection and
+request timeouts, token-refresh transport failures, truncated JSON responses,
+and interrupted MIME streams. Partial MIME files are removed before a transfer
+is retried. Permanent Graph responses, malformed successful JSON, and local
+filesystem failures are not retried.
+
+Folder and message delta requests ask Graph for up to 1,000 changes per page
+and repeat that preference on continuation requests; Graph may return fewer.
+Synchronization uses deterministic Maildir keys, bounded four-at-a-time MIME
+transfers, serialized atomic Maildir delivery, SQLite-backed delta checkpoints,
+and cloud-wins conflict handling that preserves divergent local content. Local
+flag, move, trash, and delete mutations use a durable SQLite journal and are
+cleared only after Graph accepts them and their matching delta change is
+observed.
 
 By default, SQLite, completed MIME files, and affected Maildir directories are
 synchronized durably before progress is committed. `sync --no-fsync` explicitly

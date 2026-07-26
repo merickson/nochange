@@ -20,6 +20,7 @@ use url::Url;
 const GRAPH_ROOT: &str = "https://graph.microsoft.com/v1.0";
 const DEFAULT_MAX_ATTEMPTS: u32 = 8;
 const DEFAULT_MAX_TOTAL_DELAY: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const IMMUTABLE_ID_PREFERENCE: &str = "IdType=\"ImmutableId\"";
 const DELTA_PREFERENCE: &str = "IdType=\"ImmutableId\", odata.maxpagesize=1000";
 
@@ -153,11 +154,26 @@ where
         sleeper: Arc<S>,
         retry_policy: RetryPolicy,
     ) -> Result<Self, GraphError> {
+        Self::build_for_test_with_timeout(
+            token_provider,
+            sleeper,
+            retry_policy,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+    }
+
+    #[cfg(test)]
+    fn build_for_test_with_timeout(
+        token_provider: Arc<P>,
+        sleeper: Arc<S>,
+        retry_policy: RetryPolicy,
+        request_timeout: Duration,
+    ) -> Result<Self, GraphError> {
         Ok(Self {
             token_provider,
             sleeper,
             retry_policy,
-            http_client: build_http_client()?,
+            http_client: build_http_client_with_timeout(request_timeout)?,
             fsync_enabled: true,
         })
     }
@@ -179,11 +195,23 @@ where
     where
         T: DeserializeOwned,
     {
-        let response = self
-            .get_success_response(url, "application/json", preference)
-            .await?;
-        let body = response.bytes().await.map_err(classify_request_error)?;
-        serde_json::from_slice(&body).map_err(|_| GraphError::MalformedJson)
+        let mut retry_number = 0;
+        let mut total_delay = Duration::ZERO;
+        loop {
+            let response = self
+                .get_success_response(url, "application/json", preference)
+                .await?;
+            match response.bytes().await {
+                Ok(body) => {
+                    return serde_json::from_slice(&body).map_err(|_| GraphError::MalformedJson);
+                }
+                Err(error) if is_retryable_request_error(&error) => {
+                    self.sleep_before_transport_retry(&mut retry_number, &mut total_delay)
+                        .await?;
+                }
+                Err(error) => return Err(classify_request_error(error)),
+            }
+        }
     }
 
     /// Fetch one validated page of mailbox-folder delta changes.
@@ -331,6 +359,26 @@ where
         url: &GraphUrl,
         destination: &std::path::Path,
     ) -> Result<(), GraphError> {
+        let mut retry_number = 0;
+        let mut total_delay = Duration::ZERO;
+        loop {
+            match self.download_once(url, destination).await {
+                Ok(()) => return Ok(()),
+                Err(GraphError::Request | GraphError::Timeout) => {
+                    self.sleep_before_transport_retry(&mut retry_number, &mut total_delay)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Attempt one MIME transfer, removing any partial destination on failure.
+    async fn download_once(
+        &self,
+        url: &GraphUrl,
+        destination: &std::path::Path,
+    ) -> Result<(), GraphError> {
         let mut options = tokio::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -472,7 +520,15 @@ where
         let mut retry_number = 0;
         let mut total_delay = Duration::ZERO;
         loop {
-            let access_token = self.token_provider.get_access_token(force_refresh).await?;
+            let access_token = match self.token_provider.get_access_token(force_refresh).await {
+                Ok(access_token) => access_token,
+                Err(AuthError::TokenRequest) => {
+                    self.sleep_before_transport_retry(&mut retry_number, &mut total_delay)
+                        .await?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             force_refresh = false;
             let mut request = self
                 .http_client
@@ -483,7 +539,15 @@ where
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request.send().await.map_err(classify_request_error)?;
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) if is_retryable_request_error(&error) => {
+                    self.sleep_before_transport_retry(&mut retry_number, &mut total_delay)
+                        .await?;
+                    continue;
+                }
+                Err(error) => return Err(classify_request_error(error)),
+            };
             let status = response.status().as_u16();
             if status == 401 && !refreshed_after_unauthorized {
                 refreshed_after_unauthorized = true;
@@ -515,9 +579,31 @@ where
             if successful {
                 return Ok(response);
             }
-            let body = response.bytes().await.map_err(classify_request_error)?;
-            return Err(build_response_error(status, request_id, &body));
+            match response.bytes().await {
+                Ok(body) => return Err(build_response_error(status, request_id, &body)),
+                Err(error) if is_retryable_request_error(&error) => {
+                    self.sleep_before_transport_retry(&mut retry_number, &mut total_delay)
+                        .await?;
+                }
+                Err(error) => return Err(classify_request_error(error)),
+            }
         }
+    }
+
+    /// Apply the bounded exponential delay shared by transport and token retries.
+    async fn sleep_before_transport_retry(
+        &self,
+        retry_number: &mut u32,
+        total_delay: &mut Duration,
+    ) -> Result<(), GraphError> {
+        let delay = self
+            .retry_policy
+            .get_retry_delay(503, None, *retry_number, *total_delay, SystemTime::now())?
+            .ok_or(GraphError::RetryExhausted)?;
+        self.sleeper.sleep(delay).await;
+        *total_delay += delay;
+        *retry_number += 1;
+        Ok(())
     }
 }
 
@@ -724,7 +810,7 @@ fn get_message_metadata_url(
 }
 
 fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
@@ -888,12 +974,22 @@ fn validate_resource_id(id: &str) -> Result<(), GraphError> {
 }
 
 fn build_http_client() -> Result<reqwest::Client, GraphError> {
+    build_http_client_with_timeout(DEFAULT_REQUEST_TIMEOUT)
+}
+
+fn build_http_client_with_timeout(
+    request_timeout: Duration,
+) -> Result<reqwest::Client, GraphError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(60))
+        .timeout(request_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| GraphError::HttpClient)
+}
+
+fn is_retryable_request_error(error: &reqwest::Error) -> bool {
+    !error.is_builder()
 }
 
 fn classify_request_error(error: reqwest::Error) -> GraphError {
@@ -940,6 +1036,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::task::JoinHandle;
     use wiremock::matchers::{body_json, header, header_regex, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -989,6 +1087,39 @@ mod tests {
         retry_after: Option<&'static str>,
     }
 
+    struct FirstDelayedResponseThenSuccess {
+        calls: AtomicUsize,
+        delay: Duration,
+    }
+
+    impl Respond for FirstDelayedResponseThenSuccess {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200)
+                    .set_delay(self.delay)
+                    .set_body_json(serde_json::json!({"id": "late-user-id"}))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "retried-user-id"}))
+            }
+        }
+    }
+
+    struct FlakyTokenProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AccessTokenProvider for FlakyTokenProvider {
+        async fn get_access_token(&self, _force_refresh: bool) -> Result<SecretString, AuthError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(AuthError::TokenRequest)
+            } else {
+                Ok("retried-access-token".into())
+            }
+        }
+    }
+
     impl Respond for FirstResponseThenSuccess {
         fn respond(&self, _request: &Request) -> ResponseTemplate {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1015,6 +1146,54 @@ mod tests {
 
     fn build_test_url(server: &MockServer, path: &str) -> GraphUrl {
         GraphUrl(format!("{}{}", server.uri(), path))
+    }
+
+    async fn start_truncated_then_complete_server(
+        content_type: &'static str,
+        complete_body: &'static [u8],
+    ) -> (GraphUrl, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener address should load");
+        let task = tokio::spawn(async move {
+            for truncated in [true, false] {
+                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let mut request = [0_u8; 4096];
+                let _read = stream
+                    .read(&mut request)
+                    .await
+                    .expect("request should be readable");
+                let body = if truncated {
+                    &complete_body[..complete_body.len().min(2)]
+                } else {
+                    complete_body
+                };
+                let declared_length = if truncated {
+                    complete_body.len() + 100
+                } else {
+                    complete_body.len()
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("response headers should write");
+                stream
+                    .write_all(body)
+                    .await
+                    .expect("response body should write");
+                stream.shutdown().await.expect("response should close");
+            }
+        });
+        (
+            GraphUrl(format!("http://{address}/v1.0/flaky-response")),
+            task,
+        )
     }
 
     #[test]
@@ -1256,6 +1435,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_request_timeouts_and_transient_token_refresh_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/timeout"))
+            .respond_with(FirstDelayedResponseThenSuccess {
+                calls: AtomicUsize::new(0),
+                delay: Duration::from_millis(50),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "token-user-id"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let timeout_sleeper = Arc::new(RecordingSleeper::default());
+        let timeout_transport = GraphTransport::build_for_test_with_timeout(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::clone(&timeout_sleeper),
+            RetryPolicy::default(),
+            Duration::from_millis(10),
+        )
+        .expect("timeout transport should build");
+        let token_sleeper = Arc::new(RecordingSleeper::default());
+        let token_provider = Arc::new(FlakyTokenProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let token_transport = GraphTransport::build_for_test(
+            Arc::clone(&token_provider),
+            Arc::clone(&token_sleeper),
+            RetryPolicy::default(),
+        )
+        .expect("token transport should build");
+
+        let timeout_profile: TestProfile = timeout_transport
+            .get_json(&build_test_url(&server, "/v1.0/timeout"))
+            .await
+            .expect("timed-out request should retry");
+        let token_profile: TestProfile = token_transport
+            .get_json(&build_test_url(&server, "/v1.0/token"))
+            .await
+            .expect("failed token refresh should retry");
+
+        assert_eq!(timeout_profile.id, "retried-user-id");
+        assert_eq!(token_profile.id, "token-user-id");
+        assert_eq!(token_provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *timeout_sleeper
+                .delays
+                .lock()
+                .expect("timeout delays should load"),
+            [Duration::from_secs(1)]
+        );
+        assert_eq!(
+            *token_sleeper
+                .delays
+                .lock()
+                .expect("token delays should load"),
+            [Duration::from_secs(1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_truncated_json_and_mime_response_bodies() {
+        let (json_url, json_server) =
+            start_truncated_then_complete_server("application/json", br#"{"id":"retried-user"}"#)
+                .await;
+        let json_sleeper = Arc::new(RecordingSleeper::default());
+        let json_transport = build_test_transport(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::clone(&json_sleeper),
+            RetryPolicy::default(),
+        );
+
+        let profile: TestProfile = json_transport
+            .get_json(&json_url)
+            .await
+            .expect("truncated JSON body should retry");
+        json_server.await.expect("JSON server should complete");
+
+        let mime = b"Subject: Retried\r\n\r\nComplete body\r\n";
+        let (mime_url, mime_server) =
+            start_truncated_then_complete_server("message/rfc822", mime).await;
+        let mime_sleeper = Arc::new(RecordingSleeper::default());
+        let mime_transport = build_test_transport(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::clone(&mime_sleeper),
+            RetryPolicy::default(),
+        );
+        let temp = tempfile::TempDir::new().expect("temporary directory should be created");
+        let destination = temp.path().join("message.eml");
+
+        mime_transport
+            .download_to(&mime_url, &destination)
+            .await
+            .expect("truncated MIME body should retry");
+        mime_server.await.expect("MIME server should complete");
+
+        assert_eq!(profile.id, "retried-user");
+        assert_eq!(
+            std::fs::read(destination).expect("MIME should be readable"),
+            mime
+        );
+        assert_eq!(
+            *json_sleeper.delays.lock().expect("JSON delays should load"),
+            [Duration::from_secs(1)]
+        );
+        assert_eq!(
+            *mime_sleeper.delays.lock().expect("MIME delays should load"),
+            [Duration::from_secs(1)]
+        );
+    }
+
+    #[tokio::test]
     async fn returns_safe_graph_codes_and_request_ids() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1433,7 +1731,7 @@ mod tests {
 
         assert_eq!(
             transport.get_json::<TestProfile>(&url).await,
-            Err(GraphError::Request)
+            Err(GraphError::RetryExhausted)
         );
     }
 

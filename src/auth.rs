@@ -3,8 +3,9 @@
 use async_trait::async_trait;
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, CsrfToken, DeviceAuthorizationUrl,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope,
-    StandardDeviceAuthorizationResponse, TokenResponse, TokenUrl, basic::BasicClient,
+    ErrorResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
+    RequestTokenError, Scope, StandardDeviceAuthorizationResponse, TokenResponse, TokenUrl,
+    basic::BasicClient,
 };
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
@@ -369,7 +370,7 @@ impl EntraTokenExchange {
             )
             .request_async(&self.http_client)
             .await
-            .map_err(|_| AuthError::TokenExchange)?;
+            .map_err(classify_token_exchange_error)?;
         let verification_uri = Url::parse(response.verification_uri().url().as_str())
             .map_err(|_| AuthError::InvalidEndpoint)?;
         let user_code = SecretString::from(response.user_code().secret().as_str());
@@ -394,7 +395,7 @@ impl EntraTokenExchange {
             .exchange_device_access_token(&session.response)
             .request_async(&self.http_client, tokio::time::sleep, None)
             .await
-            .map_err(|_| AuthError::TokenExchange)?;
+            .map_err(classify_token_exchange_error)?;
         Ok(TokenGrant {
             access_token: response.access_token().secret().as_str().into(),
             refresh_token: response
@@ -425,7 +426,7 @@ impl EntraTokenExchange {
             .set_pkce_verifier(session.get_pkce_verifier())
             .request_async(&self.http_client)
             .await
-            .map_err(|_| AuthError::TokenExchange)?;
+            .map_err(classify_token_exchange_error)?;
         Ok(TokenGrant {
             access_token: response.access_token().secret().as_str().into(),
             refresh_token: response
@@ -457,7 +458,7 @@ impl OAuthTokenExchange for EntraTokenExchange {
             )
             .request_async(&self.http_client)
             .await
-            .map_err(|_| AuthError::TokenExchange)?;
+            .map_err(classify_token_exchange_error)?;
         Ok(TokenGrant {
             access_token: response.access_token().secret().as_str().into(),
             refresh_token: response
@@ -586,6 +587,9 @@ pub enum AuthError {
     /// Microsoft Entra rejected or could not complete a token exchange.
     #[error("Microsoft Entra token exchange failed")]
     TokenExchange,
+    /// A token exchange failed while sending or receiving its HTTP request.
+    #[error("Microsoft Entra token request failed")]
+    TokenRequest,
     /// The hardened OAuth HTTP client could not be created.
     #[error("could not create the OAuth HTTP client")]
     HttpClient,
@@ -604,6 +608,17 @@ pub enum AuthError {
     /// The user or Microsoft Entra denied the authorization request.
     #[error("Microsoft Entra authorization was denied")]
     AuthorizationDenied,
+}
+
+fn classify_token_exchange_error<RE, T>(error: RequestTokenError<RE, T>) -> AuthError
+where
+    RE: std::error::Error + 'static,
+    T: ErrorResponse + 'static,
+{
+    match error {
+        RequestTokenError::Request(_) => AuthError::TokenRequest,
+        _ => AuthError::TokenExchange,
+    }
 }
 
 fn validate_tenant(tenant: &str) -> Result<(), AuthError> {
