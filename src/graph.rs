@@ -234,6 +234,73 @@ where
         self.update_message_flags_at(&url, flags).await
     }
 
+    /// Resolve the immutable ID of the mailbox's well-known Deleted Items folder.
+    pub async fn get_deleted_items_folder_id(&self) -> Result<String, GraphError> {
+        let url = GraphUrl::build("/me/mailFolders/deleteditems?$select=id")?;
+        self.get_deleted_items_folder_id_from(&url).await
+    }
+
+    async fn get_deleted_items_folder_id_from(&self, url: &GraphUrl) -> Result<String, GraphError> {
+        let folder: FolderIdResource = self.get_json(url).await?;
+        validate_resource_id(&folder.id)?;
+        Ok(folder.id)
+    }
+
+    /// Move one immutable message to an immutable destination folder.
+    pub async fn move_message(
+        &self,
+        message_id: &str,
+        destination_folder_id: &str,
+    ) -> Result<(), GraphError> {
+        validate_resource_id(message_id)?;
+        validate_resource_id(destination_folder_id)?;
+        let encoded_id = utf8_percent_encode(message_id, NON_ALPHANUMERIC);
+        let url = GraphUrl::build(&format!("/me/messages/{encoded_id}/move"))?;
+        self.move_message_at(&url, destination_folder_id).await
+    }
+
+    async fn move_message_at(
+        &self,
+        url: &GraphUrl,
+        destination_folder_id: &str,
+    ) -> Result<(), GraphError> {
+        validate_resource_id(destination_folder_id)?;
+        let body = serde_json::json!({"destinationId": destination_folder_id});
+        self.send_success_response(
+            Method::POST,
+            url,
+            "application/json",
+            IMMUTABLE_ID_PREFERENCE,
+            Some(&body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Permanently delete one immutable message, accepting an idempotent replay.
+    pub async fn delete_message(&self, message_id: &str) -> Result<(), GraphError> {
+        validate_resource_id(message_id)?;
+        let encoded_id = utf8_percent_encode(message_id, NON_ALPHANUMERIC);
+        let url = GraphUrl::build(&format!("/me/messages/{encoded_id}"))?;
+        self.delete_message_at(&url).await
+    }
+
+    async fn delete_message_at(&self, url: &GraphUrl) -> Result<(), GraphError> {
+        match self
+            .send_success_response(
+                Method::DELETE,
+                url,
+                "application/json",
+                IMMUTABLE_ID_PREFERENCE,
+                None,
+            )
+            .await
+        {
+            Ok(_) | Err(GraphError::Response { status: 404, .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn update_message_flags_at(
         &self,
         url: &GraphUrl,
@@ -483,6 +550,19 @@ pub trait GraphApi: Send + Sync {
         message_id: &str,
         flags: MessageFlags,
     ) -> Result<(), GraphError>;
+
+    /// Resolve the immutable ID of the well-known Deleted Items folder.
+    async fn get_deleted_items_folder_id(&self) -> Result<String, GraphError>;
+
+    /// Move one immutable message to an immutable destination folder.
+    async fn move_message(
+        &self,
+        message_id: &str,
+        destination_folder_id: &str,
+    ) -> Result<(), GraphError>;
+
+    /// Permanently delete one immutable message.
+    async fn delete_message(&self, message_id: &str) -> Result<(), GraphError>;
 }
 
 #[async_trait]
@@ -520,6 +600,22 @@ where
         flags: MessageFlags,
     ) -> Result<(), GraphError> {
         Self::update_message_flags(self, message_id, flags).await
+    }
+
+    async fn get_deleted_items_folder_id(&self) -> Result<String, GraphError> {
+        Self::get_deleted_items_folder_id(self).await
+    }
+
+    async fn move_message(
+        &self,
+        message_id: &str,
+        destination_folder_id: &str,
+    ) -> Result<(), GraphError> {
+        Self::move_message(self, message_id, destination_folder_id).await
+    }
+
+    async fn delete_message(&self, message_id: &str) -> Result<(), GraphError> {
+        Self::delete_message(self, message_id).await
     }
 }
 
@@ -694,6 +790,11 @@ struct MessageDeltaResource {
 #[serde(rename_all = "camelCase")]
 struct MessageFlagResource {
     flag_status: String,
+}
+
+#[derive(Deserialize)]
+struct FolderIdResource {
+    id: String,
 }
 
 fn build_delta_links(
@@ -1003,6 +1104,89 @@ mod tests {
             )
             .await
             .expect("supported flags should patch");
+    }
+
+    #[tokio::test]
+    async fn moves_and_deletes_messages_with_immutable_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/messages/message-id/move"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .and(body_json(
+                serde_json::json!({"destinationId": "archive-id"}),
+            ))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1.0/me/messages/deleted-id"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1.0/me/messages/already-deleted-id"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let transport = build_test_transport(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::new(RecordingSleeper::default()),
+            RetryPolicy::default(),
+        );
+
+        transport
+            .move_message_at(
+                &build_test_url(&server, "/v1.0/me/messages/message-id/move"),
+                "archive-id",
+            )
+            .await
+            .expect("message should move");
+        transport
+            .delete_message_at(&build_test_url(&server, "/v1.0/me/messages/deleted-id"))
+            .await
+            .expect("message should delete");
+        transport
+            .delete_message_at(&build_test_url(
+                &server,
+                "/v1.0/me/messages/already-deleted-id",
+            ))
+            .await
+            .expect("a replayed delete should be idempotent");
+    }
+
+    #[tokio::test]
+    async fn resolves_the_well_known_deleted_items_folder_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/mailFolders/deleteditems"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "deleted-items-id"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let transport = build_test_transport(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::new(RecordingSleeper::default()),
+            RetryPolicy::default(),
+        );
+
+        assert_eq!(
+            transport
+                .get_deleted_items_folder_id_from(&build_test_url(
+                    &server,
+                    "/v1.0/me/mailFolders/deleteditems?$select=id",
+                ))
+                .await
+                .expect("well-known folder should resolve"),
+            "deleted-items-id"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use nochange::model::{FollowUpState, MessageFlags};
 use nochange::state::{
-    PendingFlagOperation, StateDatabase, StateError, StoredFolder, StoredMessage,
-    get_account_lock_path,
+    LocationOperationTarget, PendingFlagOperation, PendingLocationOperation, StateDatabase,
+    StateError, StoredFolder, StoredMessage, get_account_lock_path,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -45,7 +45,7 @@ fn creates_a_private_versioned_wal_database() {
 
     assert_eq!(
         database.get_schema_version().expect("version should load"),
-        3
+        4
     );
     assert_eq!(
         database
@@ -71,6 +71,73 @@ fn creates_a_private_versioned_wal_database() {
             0o600
         );
     }
+}
+
+#[test]
+fn journals_pending_move_and_delete_operations_through_submission() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let mut database =
+        StateDatabase::open(&temp.path().join("state.sqlite3")).expect("database should open");
+    database
+        .ensure_account("work", "me@example.com")
+        .expect("account should be recorded");
+    for (id, path) in [("inbox-id", "Inbox"), ("archive-id", "Archive")] {
+        database
+            .upsert_folder("work", &build_folder(id, path))
+            .expect("folder should be stored");
+    }
+    for id in ["move-id", "delete-id"] {
+        database
+            .upsert_message("work", &build_message(id, "inbox-id"))
+            .expect("message should be stored");
+    }
+    let moved = PendingLocationOperation {
+        message_id: "move-id".into(),
+        target: LocationOperationTarget::Folder("archive-id".into()),
+        relative_path: Some("Archive/cur/key-move-id:2,S".into()),
+        submitted: false,
+    };
+    let deleted = PendingLocationOperation {
+        message_id: "delete-id".into(),
+        target: LocationOperationTarget::Delete,
+        relative_path: None,
+        submitted: false,
+    };
+
+    database
+        .upsert_pending_location_operation("work", &moved)
+        .expect("move should be journaled");
+    database
+        .upsert_pending_location_operation("work", &deleted)
+        .expect("delete should be journaled");
+    assert_eq!(
+        database
+            .list_pending_location_operations("work")
+            .expect("location operations should load"),
+        [deleted.clone(), moved.clone()]
+    );
+
+    database
+        .mark_pending_location_operation_submitted("work", "move-id")
+        .expect("move should be marked submitted");
+    assert!(
+        database
+            .list_pending_location_operations("work")
+            .expect("location operations should load")
+            .iter()
+            .find(|operation| operation.message_id == "move-id")
+            .expect("move should remain journaled")
+            .submitted
+    );
+    database
+        .delete_pending_location_operation("work", "move-id")
+        .expect("move journal should complete");
+    assert_eq!(
+        database
+            .list_pending_location_operations("work")
+            .expect("delete should remain journaled"),
+        [deleted]
+    );
 }
 
 #[test]
@@ -185,7 +252,7 @@ fn migrates_version_one_folders_with_an_unknown_item_count() {
 
     assert_eq!(
         database.get_schema_version().expect("version should load"),
-        3
+        4
     );
     assert_eq!(folder.total_item_count, 0);
 }
@@ -260,13 +327,84 @@ fn migrates_version_two_state_with_an_empty_operation_journal() {
 
     assert_eq!(
         database.get_schema_version().expect("version should load"),
-        3
+        4
     );
     assert!(
         database
             .list_pending_flag_operations("work")
             .expect("new operation journal should be readable")
             .is_empty()
+    );
+}
+
+#[test]
+fn migrates_version_three_without_losing_a_pending_flag_update() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let path = temp.path().join("state.sqlite3");
+    let operation = PendingFlagOperation {
+        message_id: "message-id".into(),
+        flags: MessageFlags {
+            is_read: false,
+            follow_up: FollowUpState::NotFlagged,
+        },
+        relative_path: "Inbox/new/key-message-id".into(),
+        submitted: true,
+    };
+    {
+        let mut database = StateDatabase::open(&path).expect("database should open");
+        database
+            .ensure_account("work", "me@example.com")
+            .expect("account should be recorded");
+        database
+            .upsert_folder("work", &build_folder("inbox-id", "Inbox"))
+            .expect("folder should be stored");
+        database
+            .upsert_message("work", &build_message("message-id", "inbox-id"))
+            .expect("message should be stored");
+        database
+            .upsert_pending_flag_operation("work", &operation)
+            .expect("pending flag should be stored");
+    }
+    let connection = rusqlite::Connection::open(&path).expect("database should reopen");
+    connection
+        .execute_batch(
+            "ALTER TABLE pending_operations RENAME TO pending_operations_v4;
+             CREATE TABLE pending_operations (
+                account_name TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                operation_kind TEXT NOT NULL CHECK (operation_kind = 'flags'),
+                desired_is_read INTEGER NOT NULL,
+                desired_is_flagged INTEGER NOT NULL,
+                local_relative_path TEXT NOT NULL,
+                submitted INTEGER NOT NULL,
+                PRIMARY KEY (account_name, message_id, operation_kind),
+                FOREIGN KEY (account_name, message_id)
+                    REFERENCES messages(account_name, id) ON DELETE CASCADE
+             );
+             INSERT INTO pending_operations(
+                account_name, message_id, operation_kind, desired_is_read,
+                desired_is_flagged, local_relative_path, submitted
+             )
+             SELECT account_name, message_id, operation_kind, desired_is_read,
+                    desired_is_flagged, local_relative_path, submitted
+             FROM pending_operations_v4;
+             DROP TABLE pending_operations_v4;
+             PRAGMA user_version = 3;",
+        )
+        .expect("version three journal should be created");
+    drop(connection);
+
+    let database = StateDatabase::open(&path).expect("version three database should migrate");
+
+    assert_eq!(
+        database.get_schema_version().expect("version should load"),
+        4
+    );
+    assert_eq!(
+        database
+            .list_pending_flag_operations("work")
+            .expect("pending flag should survive"),
+        [operation]
     );
 }
 

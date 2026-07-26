@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Persisted remote-folder baseline and checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +65,28 @@ pub struct PendingFlagOperation {
     pub relative_path: String,
     /// Whether Graph accepted the mutation request.
     pub submitted: bool,
+}
+
+/// Remote location mutation requested from a clean tracked Maildir message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingLocationOperation {
+    /// Immutable Microsoft Graph message ID.
+    pub message_id: String,
+    /// Desired remote folder, or permanent deletion.
+    pub target: LocationOperationTarget,
+    /// Current local path, or `None` when the file disappeared.
+    pub relative_path: Option<String>,
+    /// Whether Graph accepted the mutation request.
+    pub submitted: bool,
+}
+
+/// Desired result of a journaled local message-location mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocationOperationTarget {
+    /// Move the message to this immutable Microsoft Graph folder ID.
+    Folder(String),
+    /// Permanently delete a message already in Deleted Items.
+    Delete,
 }
 
 /// Open, migrated synchronization-state database.
@@ -446,6 +468,106 @@ impl StateDatabase {
         )?;
         Ok(())
     }
+
+    /// Insert or replace one move/delete mutation before contacting Graph.
+    pub fn upsert_pending_location_operation(
+        &mut self,
+        account: &str,
+        operation: &PendingLocationOperation,
+    ) -> Result<(), StateError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM pending_operations
+             WHERE account_name = ?1 AND message_id = ?2
+               AND operation_kind IN ('move', 'delete')",
+            params![account, operation.message_id],
+        )?;
+        let (kind, target_folder_id) = match &operation.target {
+            LocationOperationTarget::Folder(folder_id) => ("move", Some(folder_id.as_str())),
+            LocationOperationTarget::Delete => ("delete", None),
+        };
+        transaction.execute(
+            "INSERT INTO pending_operations(
+                account_name, message_id, operation_kind, target_folder_id,
+                local_relative_path, submitted
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                account,
+                operation.message_id,
+                kind,
+                target_folder_id,
+                operation.relative_path,
+                operation.submitted,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// List pending move/delete mutations in deterministic message-ID order.
+    pub fn list_pending_location_operations(
+        &self,
+        account: &str,
+    ) -> Result<Vec<PendingLocationOperation>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id, operation_kind, target_folder_id,
+                    local_relative_path, submitted
+             FROM pending_operations
+             WHERE account_name = ?1 AND operation_kind IN ('move', 'delete')
+             ORDER BY message_id",
+        )?;
+        let operations = statement
+            .query_map([account], |row| {
+                let kind: String = row.get(1)?;
+                let target = if kind == "move" {
+                    LocationOperationTarget::Folder(row.get(2)?)
+                } else {
+                    LocationOperationTarget::Delete
+                };
+                Ok(PendingLocationOperation {
+                    message_id: row.get(0)?,
+                    target,
+                    relative_path: row.get(3)?,
+                    submitted: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(operations)
+    }
+
+    /// Mark one journaled move/delete mutation as accepted by Graph.
+    pub fn mark_pending_location_operation_submitted(
+        &mut self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<(), StateError> {
+        let changed = self.connection.execute(
+            "UPDATE pending_operations SET submitted = 1
+             WHERE account_name = ?1 AND message_id = ?2
+               AND operation_kind IN ('move', 'delete')",
+            params![account, message_id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StateError::UnknownPendingOperation)
+        }
+    }
+
+    /// Delete a completed move/delete mutation idempotently.
+    pub fn delete_pending_location_operation(
+        &mut self,
+        account: &str,
+        message_id: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "DELETE FROM pending_operations
+             WHERE account_name = ?1 AND message_id = ?2
+               AND operation_kind IN ('move', 'delete')",
+            params![account, message_id],
+        )?;
+        Ok(())
+    }
 }
 
 /// Exclusive per-account interprocess lock guard.
@@ -582,62 +704,80 @@ fn migrate_database(connection: &mut Connection) -> Result<(), StateError> {
                 UNIQUE (account_name, maildir_key),
                 FOREIGN KEY (account_name, folder_id)
                     REFERENCES folders(account_name, id) ON DELETE CASCADE
-             );
-             CREATE TABLE pending_operations (
-                account_name TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                operation_kind TEXT NOT NULL CHECK (operation_kind = 'flags'),
-                desired_is_read INTEGER NOT NULL CHECK (desired_is_read IN (0, 1)),
-                desired_is_flagged INTEGER NOT NULL CHECK (desired_is_flagged IN (0, 1)),
-                local_relative_path TEXT NOT NULL,
-                submitted INTEGER NOT NULL CHECK (submitted IN (0, 1)),
-                PRIMARY KEY (account_name, message_id, operation_kind),
-                FOREIGN KEY (account_name, message_id)
-                    REFERENCES messages(account_name, id) ON DELETE CASCADE
-             );
-             PRAGMA user_version = 3;",
+             );",
         )?;
+        create_pending_operations_v4(&transaction)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version == 1 {
         let transaction = connection.transaction()?;
         transaction.execute_batch(
             "ALTER TABLE folders
                 ADD COLUMN total_item_count INTEGER NOT NULL DEFAULT 0
-                CHECK (total_item_count >= 0);
-             CREATE TABLE pending_operations (
-                account_name TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                operation_kind TEXT NOT NULL CHECK (operation_kind = 'flags'),
-                desired_is_read INTEGER NOT NULL CHECK (desired_is_read IN (0, 1)),
-                desired_is_flagged INTEGER NOT NULL CHECK (desired_is_flagged IN (0, 1)),
-                local_relative_path TEXT NOT NULL,
-                submitted INTEGER NOT NULL CHECK (submitted IN (0, 1)),
-                PRIMARY KEY (account_name, message_id, operation_kind),
-                FOREIGN KEY (account_name, message_id)
-                    REFERENCES messages(account_name, id) ON DELETE CASCADE
-             );
-             PRAGMA user_version = 3;",
+                CHECK (total_item_count >= 0);",
         )?;
+        create_pending_operations_v4(&transaction)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     } else if version == 2 {
         let transaction = connection.transaction()?;
+        create_pending_operations_v4(&transaction)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    } else if version == 3 {
+        let transaction = connection.transaction()?;
+        transaction
+            .execute_batch("ALTER TABLE pending_operations RENAME TO pending_operations_v3;")?;
+        create_pending_operations_v4(&transaction)?;
         transaction.execute_batch(
-            "CREATE TABLE pending_operations (
-                account_name TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                operation_kind TEXT NOT NULL CHECK (operation_kind = 'flags'),
-                desired_is_read INTEGER NOT NULL CHECK (desired_is_read IN (0, 1)),
-                desired_is_flagged INTEGER NOT NULL CHECK (desired_is_flagged IN (0, 1)),
-                local_relative_path TEXT NOT NULL,
-                submitted INTEGER NOT NULL CHECK (submitted IN (0, 1)),
-                PRIMARY KEY (account_name, message_id, operation_kind),
-                FOREIGN KEY (account_name, message_id)
-                    REFERENCES messages(account_name, id) ON DELETE CASCADE
-             );
-             PRAGMA user_version = 3;",
+            "INSERT INTO pending_operations(
+                account_name, message_id, operation_kind, desired_is_read,
+                desired_is_flagged, local_relative_path, submitted
+             )
+             SELECT account_name, message_id, operation_kind, desired_is_read,
+                    desired_is_flagged, local_relative_path, submitted
+             FROM pending_operations_v3;
+             DROP TABLE pending_operations_v3;",
         )?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
     }
+    Ok(())
+}
+
+/// Create the operation journal shared by new databases and legacy migrations.
+fn create_pending_operations_v4(connection: &Connection) -> Result<(), StateError> {
+    connection.execute_batch(
+        "CREATE TABLE pending_operations (
+            account_name TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            operation_kind TEXT NOT NULL
+                CHECK (operation_kind IN ('flags', 'move', 'delete')),
+            desired_is_read INTEGER CHECK (desired_is_read IN (0, 1)),
+            desired_is_flagged INTEGER CHECK (desired_is_flagged IN (0, 1)),
+            target_folder_id TEXT,
+            local_relative_path TEXT,
+            submitted INTEGER NOT NULL CHECK (submitted IN (0, 1)),
+            PRIMARY KEY (account_name, message_id, operation_kind),
+            CHECK (
+                (operation_kind = 'flags'
+                 AND desired_is_read IS NOT NULL
+                 AND desired_is_flagged IS NOT NULL
+                 AND target_folder_id IS NULL
+                 AND local_relative_path IS NOT NULL)
+                OR (operation_kind = 'move'
+                    AND desired_is_read IS NULL
+                    AND desired_is_flagged IS NULL
+                    AND target_folder_id IS NOT NULL)
+                OR (operation_kind = 'delete'
+                    AND desired_is_read IS NULL
+                    AND desired_is_flagged IS NULL
+                    AND target_folder_id IS NULL)
+            ),
+            FOREIGN KEY (account_name, message_id)
+                REFERENCES messages(account_name, id) ON DELETE CASCADE
+         );",
+    )?;
     Ok(())
 }
 

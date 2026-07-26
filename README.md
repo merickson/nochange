@@ -8,8 +8,8 @@ primary mailbox.
 The Graph-based rewrite is under active development. `nochange init`
 authenticates and verifies the configured Microsoft 365 identity, and
 `nochange sync` now performs incremental cloud-to-local synchronization.
-Local read and follow-up flag changes synchronize back to Graph. Local moves,
-trash operations, and sending are not operational yet.
+Local read/follow-up flags, managed-folder moves, trash, and permanent deletion
+from Deleted Items synchronize back to Graph. Sending is not operational yet.
 
 ## Build
 
@@ -173,12 +173,21 @@ Maildir, including the `S` (read) and `F` (flagged) flags. Changes to `S` and
 Graph. Interrupted submissions replay idempotently, and the matching Graph
 delta echo completes the journal without downloading MIME again.
 
-Local moves, missing files, duplicate tracked keys, and content edits are
-reported but not changed remotely yet. `sync --dry-run` includes planned local
-flag updates and leaves both Graph and the local journal unchanged. If cloud
-state replaces or deletes a locally edited tracked MIME file, Nochange
-preserves the local bytes in `.nochange-conflicts` before applying the cloud
-result.
+Moving a clean tracked file between selected managed Maildirs moves the Graph
+message without re-downloading its MIME. Adding Maildir `T`, or removing a
+tracked file outside Deleted Items, moves the message to the mailbox's
+well-known Deleted Items folder. Adding `T` or removing a tracked file already
+in Deleted Items permanently deletes it through Graph; Microsoft 365 retention
+policies still determine final server-side retention.
+
+Move, trash, delete, and flag requests are journaled before Graph is contacted,
+replay after interruptions, and complete when their matching delta changes are
+observed. `sync --dry-run` reports all of these planned operations without
+mutating Graph, Maildir, state, checkpoints, or the journal. Duplicate tracked
+keys, locally edited MIME, moves that rewrite Nochange's deterministic key, and
+untracked local messages remain deferred and are not uploaded. If cloud state
+replaces or deletes locally edited tracked MIME, Nochange preserves the local
+bytes in `.nochange-conflicts` before applying the cloud result.
 
 ## CLI
 
@@ -220,9 +229,9 @@ for up to 1,000 changes per page and repeat that preference on continuation
 requests; Graph may return fewer. Synchronization uses deterministic Maildir
 keys, bounded four-at-a-time MIME transfers, serialized atomic Maildir delivery,
 SQLite-backed delta checkpoints, and cloud-wins conflict handling that
-preserves divergent local content. Local flag mutations use a durable SQLite
-journal and are cleared only after their matching delta echo is observed.
-Later phases will add local move and trash mutations.
+preserves divergent local content. Local flag, move, trash, and delete
+mutations use a durable SQLite journal and are cleared only after Graph accepts
+them and their matching delta change is observed.
 
 By default, SQLite, completed MIME files, and affected Maildir directories are
 synchronized durably before progress is committed. `sync --no-fsync` explicitly

@@ -4,7 +4,10 @@ use crate::config::AccountConfig;
 use crate::graph::{GraphApi, GraphError};
 use crate::maildir::{MaildirError, MaildirStore, get_encoded_folder_path, get_maildir_key};
 use crate::model::{DeltaChange, RemoteFolderMetadata, RemoteMessage};
-use crate::state::{PendingFlagOperation, StateDatabase, StateError, StoredFolder, StoredMessage};
+use crate::state::{
+    LocationOperationTarget, PendingFlagOperation, PendingLocationOperation, StateDatabase,
+    StateError, StoredFolder, StoredMessage,
+};
 use futures_util::future::join_all;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
@@ -29,7 +32,13 @@ pub struct SyncSummary {
     pub conflicted: usize,
     /// Number of local supported flag changes submitted or planned for Graph.
     pub local_flag_updates: usize,
-    /// Number of local missing, moved, duplicated, or edited tracked files deferred.
+    /// Number of clean local moves between managed folders.
+    pub local_moves: usize,
+    /// Number of local trash operations moving messages to Deleted Items.
+    pub local_trashed: usize,
+    /// Number of local permanent deletions from Deleted Items.
+    pub local_deleted: usize,
+    /// Number of local duplicated or edited tracked files deferred.
     pub local_ignored: usize,
 }
 
@@ -39,6 +48,17 @@ pub enum SyncActionKind {
     /// Create, refresh, move, or update flags for a message.
     Upsert,
     /// Remove a message that no longer exists in the selected cloud folder.
+    Delete,
+}
+
+/// Safe classification of a local location mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalLocationActionKind {
+    /// Move between two selected managed folders.
+    Move,
+    /// Move to the mailbox's Deleted Items folder.
+    Trash,
+    /// Permanently delete a message already in Deleted Items.
     Delete,
 }
 
@@ -82,14 +102,30 @@ pub enum SyncProgress {
     LocalScanCompleted {
         /// Supported flag mutations discovered.
         flag_updates: usize,
-        /// Tracked messages found in a different managed folder.
-        moved: usize,
-        /// Tracked messages absent from managed folders.
-        missing: usize,
+        /// Clean tracked messages moved between managed folders.
+        moves: usize,
+        /// Messages marked `T` or removed outside Deleted Items.
+        trashed: usize,
+        /// Messages marked `T` or removed from Deleted Items.
+        deleted: usize,
         /// Tracked keys with multiple managed files.
         duplicates: usize,
         /// Flag-change candidates whose MIME diverged locally.
         edited: usize,
+    },
+    /// Journaled local move/trash/delete mutations are being submitted.
+    LocalLocationApplyStarted {
+        /// Number of Graph mutations to submit in this run.
+        total: usize,
+    },
+    /// One journaled local location mutation is being submitted.
+    LocalLocationApplyProgress {
+        /// One-based mutation position.
+        position: usize,
+        /// Total mutations submitted in this run.
+        total: usize,
+        /// Safe action classification.
+        action: LocalLocationActionKind,
     },
     /// Journaled local flag mutations are being submitted.
     LocalFlagApplyStarted {
@@ -239,12 +275,17 @@ where
             .cloned()
             .collect();
         summary.folders = selected.len();
-        let local_plan = self.build_local_flag_plan(account, state, maildir, &selected)?;
+        let local_plan = self
+            .build_local_plan(account, state, maildir, &selected)
+            .await?;
         summary.local_ignored = local_plan.get_ignored_count();
-        self.apply_local_flag_plan(account, state, local_plan, &mut summary)
+        self.apply_local_location_plan(account, state, &local_plan, &mut summary)
+            .await?;
+        self.apply_local_flag_plan(account, state, local_plan.flag_updates, &mut summary)
             .await?;
         let rounds = self.collect_message_rounds(&selected).await?;
         let mut changes = collapse_message_changes(&rounds);
+        self.suppress_local_location_echoes(account, state, maildir, &mut changes)?;
         self.suppress_local_flag_echoes(account, state, maildir, &mut changes)?;
         self.apply_message_changes(account, state, maildir, changes, &mut summary)
             .await?;
@@ -254,17 +295,19 @@ where
         Ok(summary)
     }
 
-    fn build_local_flag_plan(
+    async fn build_local_plan(
         &self,
         account: &AccountConfig,
         state: &StateDatabase,
         maildir: &MaildirStore,
         folders: &[StoredFolder],
-    ) -> Result<LocalFlagPlan, SyncError> {
+    ) -> Result<LocalPlan, SyncError> {
         let mut messages = Vec::new();
         let mut folder_paths = HashMap::new();
+        let mut folder_ids_by_path = HashMap::new();
         for folder in folders {
             folder_paths.insert(folder.id.clone(), folder.local_path.clone());
+            folder_ids_by_path.insert(folder.local_path.clone(), folder.id.clone());
             messages.extend(state.list_messages(&account.name, &folder.id)?);
         }
         self.reporter.report(SyncProgress::LocalScanStarted {
@@ -272,7 +315,7 @@ where
             tracked: messages.len(),
         });
         if messages.is_empty() {
-            let plan = LocalFlagPlan::default();
+            let plan = LocalPlan::default();
             self.report_local_scan(&plan);
             return Ok(plan);
         }
@@ -284,81 +327,226 @@ where
             .iter()
             .map(|folder| folder.local_path.clone())
             .collect();
-        let scanned = maildir.scan_tracked_messages(&local_paths, &tracked_keys)?;
+        let scan = maildir.scan_managed_messages(&local_paths, &tracked_keys)?;
+        let scanned = &scan.tracked;
         let pending: HashMap<String, PendingFlagOperation> = state
             .list_pending_flag_operations(&account.name)?
             .into_iter()
             .map(|operation| (operation.message_id.clone(), operation))
             .collect();
-        let mut plan = LocalFlagPlan::default();
+        let pending_locations: HashMap<String, PendingLocationOperation> = state
+            .list_pending_location_operations(&account.name)?
+            .into_iter()
+            .map(|operation| (operation.message_id.clone(), operation))
+            .collect();
+        let needs_deleted_items = messages.iter().any(|message| {
+            let matches = scanned
+                .get(&message.maildir_key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            matches.is_empty() || matches.iter().any(|local| local.is_trashed)
+        });
+        let deleted_items_folder_id = if needs_deleted_items {
+            Some(self.graph.get_deleted_items_folder_id().await?)
+        } else {
+            None
+        };
+        let mut plan = LocalPlan {
+            deleted_items_folder_id,
+            ..LocalPlan::default()
+        };
         for message in messages {
             let matches = scanned
                 .get(&message.maildir_key)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let [local] = matches else {
-                if matches.is_empty() {
-                    plan.missing += 1;
-                } else {
-                    plan.duplicates += 1;
-                }
+            if matches.len() > 1 {
+                plan.duplicates += 1;
                 continue;
-            };
-            let expected_folder = folder_paths
+            }
+            if matches.is_empty() && scan.untracked > 0 {
+                plan.deferred += 1;
+                continue;
+            }
+            let _expected_folder = folder_paths
                 .get(&message.folder_id)
                 .ok_or_else(|| StateError::UnknownFolder(message.folder_id.clone()))?;
-            if !local
-                .relative_path
-                .strip_prefix(expected_folder)
-                .is_some_and(|suffix| suffix.starts_with('/'))
+            let local = matches.first();
+            let local_folder_id = local
+                .and_then(|value| get_local_folder_path(&value.relative_path))
+                .and_then(|path| folder_ids_by_path.get(path));
+            let moved = local_folder_id.is_some_and(|folder_id| folder_id != &message.folder_id);
+            let location_changed =
+                local.is_none() || local.is_some_and(|value| value.is_trashed) || moved;
+            let flags_changed = local.is_some_and(|value| value.flags != message.flags);
+            if (location_changed || flags_changed)
+                && let Some(local) = local
+                && maildir.get_message_hash(&local.relative_path)? != message.mime_hash
             {
-                plan.moved += 1;
-                continue;
-            }
-            if local.flags == message.flags {
-                continue;
-            }
-            if maildir.get_message_hash(&local.relative_path)? != message.mime_hash {
                 plan.edited += 1;
                 continue;
             }
-            let operation = PendingFlagOperation {
-                message_id: message.id.clone(),
-                flags: local.flags,
-                relative_path: local.relative_path.clone(),
-                submitted: false,
-            };
-            let needs_journal = pending.get(&message.id).is_none_or(|existing| {
-                existing.flags != operation.flags
-                    || existing.relative_path != operation.relative_path
-            });
-            plan.flag_updates.push(PlannedFlagUpdate {
-                operation,
-                needs_journal,
-            });
+
+            let mut deletes_message = false;
+            if location_changed {
+                let (target, kind) =
+                    if local.is_none() || local.is_some_and(|value| value.is_trashed) {
+                        let deleted_items = plan
+                            .deleted_items_folder_id
+                            .as_ref()
+                            .ok_or(SyncError::MissingDeletedItemsFolder)?;
+                        if message.folder_id == *deleted_items {
+                            (
+                                LocationOperationTarget::Delete,
+                                LocalLocationActionKind::Delete,
+                            )
+                        } else {
+                            (
+                                LocationOperationTarget::Folder(deleted_items.clone()),
+                                LocalLocationActionKind::Trash,
+                            )
+                        }
+                    } else {
+                        let target_folder_id = local_folder_id
+                            .cloned()
+                            .ok_or_else(|| StateError::UnknownFolder(message.folder_id.clone()))?;
+                        (
+                            LocationOperationTarget::Folder(target_folder_id),
+                            LocalLocationActionKind::Move,
+                        )
+                    };
+                deletes_message = kind == LocalLocationActionKind::Delete;
+                let operation = PendingLocationOperation {
+                    message_id: message.id.clone(),
+                    target,
+                    relative_path: local.map(|value| value.relative_path.clone()),
+                    submitted: false,
+                };
+                let existing = pending_locations.get(&message.id);
+                if existing.is_some_and(|value| {
+                    value.submitted
+                        && (value.target != operation.target
+                            || value.relative_path != operation.relative_path)
+                }) {
+                    plan.deferred += 1;
+                    continue;
+                }
+                let needs_journal = existing.is_none_or(|value| {
+                    value.target != operation.target
+                        || value.relative_path != operation.relative_path
+                });
+                plan.location_updates.push(PlannedLocationUpdate {
+                    operation,
+                    needs_journal,
+                    kind,
+                });
+            }
+
+            if flags_changed && !deletes_message {
+                let local = local.ok_or(MaildirError::UnsafePath)?;
+                let operation = PendingFlagOperation {
+                    message_id: message.id.clone(),
+                    flags: local.flags,
+                    relative_path: local.relative_path.clone(),
+                    submitted: false,
+                };
+                let existing = pending.get(&message.id);
+                if existing.is_some_and(|value| {
+                    value.submitted
+                        && (value.flags != operation.flags
+                            || value.relative_path != operation.relative_path)
+                }) {
+                    plan.deferred += 1;
+                    continue;
+                }
+                let needs_journal = existing.is_none_or(|existing| {
+                    existing.flags != operation.flags
+                        || existing.relative_path != operation.relative_path
+                });
+                plan.flag_updates.push(PlannedFlagUpdate {
+                    operation,
+                    needs_journal,
+                });
+            }
         }
         self.report_local_scan(&plan);
         Ok(plan)
     }
 
-    fn report_local_scan(&self, plan: &LocalFlagPlan) {
+    fn report_local_scan(&self, plan: &LocalPlan) {
         self.reporter.report(SyncProgress::LocalScanCompleted {
             flag_updates: plan.flag_updates.len(),
-            moved: plan.moved,
-            missing: plan.missing,
+            moves: plan.get_location_count(LocalLocationActionKind::Move),
+            trashed: plan.get_location_count(LocalLocationActionKind::Trash),
+            deleted: plan.get_location_count(LocalLocationActionKind::Delete),
             duplicates: plan.duplicates,
             edited: plan.edited,
         });
+    }
+
+    async fn apply_local_location_plan(
+        &self,
+        account: &AccountConfig,
+        state: &mut StateDatabase,
+        plan: &LocalPlan,
+        summary: &mut SyncSummary,
+    ) -> Result<(), SyncError> {
+        for planned in &plan.location_updates {
+            if planned.needs_journal {
+                state.upsert_pending_location_operation(&account.name, &planned.operation)?;
+            }
+        }
+        summary.local_moves = plan.get_location_count(LocalLocationActionKind::Move);
+        summary.local_trashed = plan.get_location_count(LocalLocationActionKind::Trash);
+        summary.local_deleted = plan.get_location_count(LocalLocationActionKind::Delete);
+        let pending: Vec<PendingLocationOperation> = state
+            .list_pending_location_operations(&account.name)?
+            .into_iter()
+            .filter(|operation| !operation.submitted)
+            .collect();
+        let total = pending.len();
+        self.reporter
+            .report(SyncProgress::LocalLocationApplyStarted { total });
+        for (index, operation) in pending.into_iter().enumerate() {
+            let action = match &operation.target {
+                LocationOperationTarget::Delete => LocalLocationActionKind::Delete,
+                LocationOperationTarget::Folder(folder_id)
+                    if plan.deleted_items_folder_id.as_ref() == Some(folder_id) =>
+                {
+                    LocalLocationActionKind::Trash
+                }
+                LocationOperationTarget::Folder(_) => LocalLocationActionKind::Move,
+            };
+            self.reporter
+                .report(SyncProgress::LocalLocationApplyProgress {
+                    position: index + 1,
+                    total,
+                    action,
+                });
+            match &operation.target {
+                LocationOperationTarget::Folder(folder_id) => {
+                    self.graph
+                        .move_message(&operation.message_id, folder_id)
+                        .await?;
+                }
+                LocationOperationTarget::Delete => {
+                    self.graph.delete_message(&operation.message_id).await?;
+                }
+            }
+            state
+                .mark_pending_location_operation_submitted(&account.name, &operation.message_id)?;
+        }
+        Ok(())
     }
 
     async fn apply_local_flag_plan(
         &self,
         account: &AccountConfig,
         state: &mut StateDatabase,
-        plan: LocalFlagPlan,
+        flag_updates: Vec<PlannedFlagUpdate>,
         summary: &mut SyncSummary,
     ) -> Result<(), SyncError> {
-        for planned in plan.flag_updates {
+        for planned in flag_updates {
             if planned.needs_journal {
                 state.upsert_pending_flag_operation(&account.name, &planned.operation)?;
             }
@@ -381,6 +569,114 @@ where
                 .update_message_flags(&operation.message_id, operation.flags)
                 .await?;
             state.mark_pending_flag_operation_submitted(&account.name, &operation.message_id)?;
+        }
+        Ok(())
+    }
+
+    fn suppress_local_location_echoes(
+        &self,
+        account: &AccountConfig,
+        state: &mut StateDatabase,
+        maildir: &MaildirStore,
+        changes: &mut BTreeMap<String, DeltaChange<RemoteMessage>>,
+    ) -> Result<(), SyncError> {
+        let pending_flags: HashMap<String, PendingFlagOperation> = state
+            .list_pending_flag_operations(&account.name)?
+            .into_iter()
+            .map(|operation| (operation.message_id.clone(), operation))
+            .collect();
+        let operations = state.list_pending_location_operations(&account.name)?;
+        for operation in operations {
+            if !operation.submitted {
+                continue;
+            }
+            let LocationOperationTarget::Folder(target_folder_id) = &operation.target else {
+                continue;
+            };
+            match changes.get(&operation.message_id) {
+                Some(DeltaChange::Upsert(remote)) if &remote.folder_id == target_folder_id => {
+                    let Some(existing) = state.get_message(&account.name, &operation.message_id)?
+                    else {
+                        continue;
+                    };
+                    let Some(relative_path) = operation.relative_path.as_deref() else {
+                        state.delete_pending_location_operation(
+                            &account.name,
+                            &operation.message_id,
+                        )?;
+                        continue;
+                    };
+                    let path = maildir.get_message_path(relative_path)?;
+                    if !path.is_file()
+                        || maildir.get_message_hash(relative_path)? != existing.mime_hash
+                    {
+                        continue;
+                    }
+                    let target = state
+                        .get_folder(&account.name, target_folder_id)?
+                        .filter(|folder| folder.is_selected);
+                    let Some(target) = target else {
+                        state.delete_pending_location_operation(
+                            &account.name,
+                            &operation.message_id,
+                        )?;
+                        continue;
+                    };
+                    let synchronized_path = if get_local_folder_path(relative_path)
+                        != Some(target.local_path.as_str())
+                    {
+                        let flags = pending_flags
+                            .get(&operation.message_id)
+                            .map_or(existing.flags, |pending| pending.flags);
+                        maildir.move_tracked(
+                            relative_path,
+                            &target.local_path,
+                            &existing.mime_hash,
+                            &existing.maildir_key,
+                            flags,
+                        )?
+                    } else {
+                        relative_path.to_owned()
+                    };
+                    if let Some(pending) = pending_flags.get(&operation.message_id)
+                        && pending.submitted
+                        && pending.flags != remote.flags
+                        && pending.relative_path != synchronized_path
+                    {
+                        let mut relocated_pending = pending.clone();
+                        relocated_pending.relative_path = synchronized_path.clone();
+                        state.upsert_pending_flag_operation(&account.name, &relocated_pending)?;
+                    }
+                    state.upsert_message(
+                        &account.name,
+                        &build_stored_message(
+                            remote,
+                            existing.maildir_key,
+                            synchronized_path,
+                            existing.mime_hash,
+                        ),
+                    )?;
+                    if pending_flags
+                        .get(&operation.message_id)
+                        .is_some_and(|pending| pending.submitted && pending.flags == remote.flags)
+                    {
+                        state
+                            .delete_pending_flag_operation(&account.name, &operation.message_id)?;
+                    }
+                    state
+                        .delete_pending_location_operation(&account.name, &operation.message_id)?;
+                    changes.remove(&operation.message_id);
+                }
+                Some(DeltaChange::Delete { .. }) => {
+                    let target_is_selected = state
+                        .get_folder(&account.name, target_folder_id)?
+                        .is_some_and(|folder| folder.is_selected);
+                    if target_is_selected {
+                        changes.remove(&operation.message_id);
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -751,7 +1047,9 @@ where
             folders: selected.len(),
             ..SyncSummary::default()
         };
-        let local_plan = self.build_local_flag_plan(account, state, maildir, &selected)?;
+        let local_plan = self
+            .build_local_plan(account, state, maildir, &selected)
+            .await?;
         summary.local_flag_updates = local_plan.flag_updates.len()
             + state
                 .list_pending_flag_operations(&account.name)?
@@ -764,6 +1062,9 @@ where
                         .any(|planned| planned.operation.message_id == operation.message_id)
                 })
                 .count();
+        summary.local_moves = local_plan.get_location_count(LocalLocationActionKind::Move);
+        summary.local_trashed = local_plan.get_location_count(LocalLocationActionKind::Trash);
+        summary.local_deleted = local_plan.get_location_count(LocalLocationActionKind::Delete);
         summary.local_ignored = local_plan.get_ignored_count();
         for change in changes.into_values() {
             match change {
@@ -799,17 +1100,25 @@ struct MessageRound {
 }
 
 #[derive(Debug, Default)]
-struct LocalFlagPlan {
+struct LocalPlan {
     flag_updates: Vec<PlannedFlagUpdate>,
-    moved: usize,
-    missing: usize,
+    location_updates: Vec<PlannedLocationUpdate>,
+    deleted_items_folder_id: Option<String>,
     duplicates: usize,
     edited: usize,
+    deferred: usize,
 }
 
-impl LocalFlagPlan {
+impl LocalPlan {
     fn get_ignored_count(&self) -> usize {
-        self.moved + self.missing + self.duplicates + self.edited
+        self.duplicates + self.edited + self.deferred
+    }
+
+    fn get_location_count(&self, kind: LocalLocationActionKind) -> usize {
+        self.location_updates
+            .iter()
+            .filter(|planned| planned.kind == kind)
+            .count()
     }
 }
 
@@ -817,6 +1126,13 @@ impl LocalFlagPlan {
 struct PlannedFlagUpdate {
     operation: PendingFlagOperation,
     needs_journal: bool,
+}
+
+#[derive(Debug)]
+struct PlannedLocationUpdate {
+    operation: PendingLocationOperation,
+    needs_journal: bool,
+    kind: LocalLocationActionKind,
 }
 
 #[derive(Debug)]
@@ -844,6 +1160,9 @@ pub enum SyncError {
     /// A delta page did not contain exactly one continuation or final link.
     #[error("Microsoft Graph returned an incomplete delta page")]
     InvalidDeltaPage,
+    /// The mailbox's well-known Deleted Items folder could not be resolved.
+    #[error("Microsoft Graph did not resolve the Deleted Items folder")]
+    MissingDeletedItemsFolder,
     /// Remote folder ancestry contained a cycle.
     #[error("Microsoft Graph returned a cyclic mail-folder hierarchy")]
     CyclicFolderHierarchy,
@@ -1047,6 +1366,13 @@ fn collapse_message_changes(
         }
     }
     changes
+}
+
+/// Extract the managed Maildir path above a message's `new` or `cur` directory.
+fn get_local_folder_path(relative_path: &str) -> Option<&str> {
+    let (parent, _) = relative_path.rsplit_once('/')?;
+    let (folder, subdirectory) = parent.rsplit_once('/')?;
+    matches!(subdirectory, "new" | "cur").then_some(folder)
 }
 
 fn build_stored_message(

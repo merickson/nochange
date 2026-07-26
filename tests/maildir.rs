@@ -133,7 +133,52 @@ fn scans_only_known_message_keys_and_decodes_supported_flags() {
         scanned["moved-key"][0].relative_path,
         "Archive/new/moved-key"
     );
+    assert!(!scanned["moved-key"][0].is_trashed);
     assert!(!scanned.contains_key("untracked-key"));
+}
+
+#[test]
+fn scans_the_maildir_trash_flag_separately_from_graph_flags() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let store = MaildirStore::new(temp.path());
+    store
+        .create_folder("Inbox")
+        .expect("maildir should be created");
+    fs::write(temp.path().join("Inbox/cur/tracked-key:2,FST"), b"tracked")
+        .expect("tracked message should be created");
+
+    let scanned = store
+        .scan_tracked_messages(&["Inbox".into()], &BTreeSet::from(["tracked-key".into()]))
+        .expect("maildir scan should succeed");
+
+    assert!(scanned["tracked-key"][0].is_trashed);
+    assert_eq!(
+        scanned["tracked-key"][0].flags,
+        MessageFlags {
+            is_read: true,
+            follow_up: FollowUpState::Flagged,
+        }
+    );
+}
+
+#[test]
+fn reports_untracked_files_during_a_managed_scan() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let store = MaildirStore::new(temp.path());
+    store
+        .create_folder("Inbox")
+        .expect("maildir should be created");
+    fs::write(temp.path().join("Inbox/new/tracked-key"), b"tracked")
+        .expect("tracked message should be created");
+    fs::write(temp.path().join("Inbox/new/rewritten-key"), b"untracked")
+        .expect("untracked message should be created");
+
+    let scan = store
+        .scan_managed_messages(&["Inbox".into()], &BTreeSet::from(["tracked-key".into()]))
+        .expect("managed scan should succeed");
+
+    assert_eq!(scan.tracked.len(), 1);
+    assert_eq!(scan.untracked, 1);
 }
 
 #[test]

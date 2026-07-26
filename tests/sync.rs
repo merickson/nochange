@@ -91,6 +91,11 @@ struct FakeGraph {
     downloads: Mutex<Vec<String>>,
     flag_updates: Mutex<Vec<(String, MessageFlags)>>,
     flag_update_results: Mutex<VecDeque<Result<(), GraphError>>>,
+    moves: Mutex<Vec<(String, String)>>,
+    move_results: Mutex<VecDeque<Result<(), GraphError>>>,
+    deletes: Mutex<Vec<String>>,
+    delete_results: Mutex<VecDeque<Result<(), GraphError>>>,
+    deleted_items_lookups: AtomicUsize,
     download_delay: Duration,
     active_downloads: AtomicUsize,
     max_active_downloads: AtomicUsize,
@@ -121,6 +126,11 @@ impl FakeGraph {
             downloads: Mutex::default(),
             flag_updates: Mutex::default(),
             flag_update_results: Mutex::default(),
+            moves: Mutex::default(),
+            move_results: Mutex::default(),
+            deletes: Mutex::default(),
+            delete_results: Mutex::default(),
+            deleted_items_lookups: AtomicUsize::default(),
             download_delay: Duration::ZERO,
             active_downloads: AtomicUsize::default(),
             max_active_downloads: AtomicUsize::default(),
@@ -137,6 +147,13 @@ impl FakeGraph {
         results: impl IntoIterator<Item = Result<(), GraphError>>,
     ) -> Self {
         if let Ok(mut stored) = self.flag_update_results.lock() {
+            stored.extend(results);
+        }
+        self
+    }
+
+    fn with_move_results(self, results: impl IntoIterator<Item = Result<(), GraphError>>) -> Self {
+        if let Ok(mut stored) = self.move_results.lock() {
             stored.extend(results);
         }
         self
@@ -223,6 +240,39 @@ impl GraphApi for FakeGraph {
             .map_err(|_| GraphError::Request)?
             .push((message_id.to_owned(), flags));
         self.flag_update_results
+            .lock()
+            .map_err(|_| GraphError::Request)?
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+
+    async fn get_deleted_items_folder_id(&self) -> Result<String, GraphError> {
+        self.deleted_items_lookups.fetch_add(1, Ordering::SeqCst);
+        Ok("deleted-items-id".into())
+    }
+
+    async fn move_message(
+        &self,
+        message_id: &str,
+        destination_folder_id: &str,
+    ) -> Result<(), GraphError> {
+        self.moves
+            .lock()
+            .map_err(|_| GraphError::Request)?
+            .push((message_id.into(), destination_folder_id.into()));
+        self.move_results
+            .lock()
+            .map_err(|_| GraphError::Request)?
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+
+    async fn delete_message(&self, message_id: &str) -> Result<(), GraphError> {
+        self.deletes
+            .lock()
+            .map_err(|_| GraphError::Request)?
+            .push(message_id.into());
+        self.delete_results
             .lock()
             .map_err(|_| GraphError::Request)?
             .pop_front()
@@ -344,6 +394,9 @@ async fn downloads_a_complete_multipage_folder_and_message_baseline() {
             deleted: 0,
             conflicted: 0,
             local_flag_updates: 0,
+            local_moves: 0,
+            local_trashed: 0,
+            local_deleted: 0,
             local_ignored: 0,
         }
     );
@@ -587,6 +640,351 @@ async fn replays_a_journaled_flag_update_after_graph_failure() {
 }
 
 #[tokio::test]
+async fn pushes_a_clean_managed_folder_move_and_suppresses_its_delta_echo() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    let initial_graph = FakeGraph::new(
+        [final_page(
+            vec![
+                DeltaChange::Upsert(build_folder("inbox-id", None, "Inbox")),
+                DeltaChange::Upsert(build_folder("archive-id", None, "Archive")),
+            ],
+            "folder-delta-initial-move",
+        )],
+        HashMap::from([
+            (
+                "inbox-id".into(),
+                vec![final_page(
+                    vec![DeltaChange::Upsert(build_message(
+                        "message-id",
+                        "inbox-id",
+                        "version-1",
+                        MessageFlags::default(),
+                    ))],
+                    "inbox-delta-initial-move",
+                )],
+            ),
+            (
+                "archive-id".into(),
+                vec![final_page(vec![], "archive-delta-initial-move")],
+            ),
+        ]),
+        HashMap::from([("message-id".into(), vec![Ok(b"message".to_vec())])]),
+    );
+    CloudSynchronizer::new(&initial_graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("initial synchronization should succeed");
+    let stored = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    let moved_relative_path = format!("Archive/new/{}", stored.maildir_key);
+    std::fs::rename(
+        account.maildir.join(&stored.relative_path),
+        account.maildir.join(&moved_relative_path),
+    )
+    .expect("message should move locally");
+    let failing_graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-failed-local-move")],
+        HashMap::new(),
+        HashMap::new(),
+    )
+    .with_move_results([Err(GraphError::Request)]);
+
+    let failed = CloudSynchronizer::new(&failing_graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await;
+
+    assert!(matches!(failed, Err(SyncError::Graph(GraphError::Request))));
+    let pending = state
+        .list_pending_location_operations("work")
+        .expect("failed move should remain journaled");
+    assert_eq!(pending.len(), 1);
+    assert!(!pending[0].submitted);
+
+    let graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-local-move")],
+        HashMap::from([
+            (
+                "inbox-id".into(),
+                vec![final_page(
+                    vec![DeltaChange::Delete {
+                        id: "message-id".into(),
+                    }],
+                    "inbox-delta-local-move",
+                )],
+            ),
+            (
+                "archive-id".into(),
+                vec![final_page(
+                    vec![DeltaChange::Upsert(build_message(
+                        "message-id",
+                        "archive-id",
+                        "version-2",
+                        MessageFlags::default(),
+                    ))],
+                    "archive-delta-local-move",
+                )],
+            ),
+        ]),
+        HashMap::new(),
+    );
+
+    let summary = CloudSynchronizer::new(&graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("local move should synchronize");
+
+    assert_eq!(summary.local_moves, 1);
+    assert_eq!(
+        *graph.moves.lock().expect("moves should be readable"),
+        [("message-id".into(), "archive-id".into())]
+    );
+    assert!(
+        graph
+            .downloads
+            .lock()
+            .expect("downloads should be readable")
+            .is_empty()
+    );
+    assert!(
+        state
+            .list_pending_location_operations("work")
+            .expect("move journal should load")
+            .is_empty()
+    );
+    let synchronized = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    assert_eq!(synchronized.folder_id, "archive-id");
+    assert_eq!(synchronized.relative_path, moved_relative_path);
+    assert_eq!(synchronized.remote_version, "version-2");
+}
+
+#[tokio::test]
+async fn moves_a_clean_maildir_trash_flag_to_deleted_items() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    let initial_graph = FakeGraph::new(
+        [final_page(
+            vec![
+                DeltaChange::Upsert(build_folder("inbox-id", None, "Inbox")),
+                DeltaChange::Upsert(build_folder("deleted-items-id", None, "Deleted Items")),
+            ],
+            "folder-delta-initial-trash",
+        )],
+        HashMap::from([
+            (
+                "inbox-id".into(),
+                vec![final_page(
+                    vec![DeltaChange::Upsert(build_message(
+                        "message-id",
+                        "inbox-id",
+                        "version-1",
+                        MessageFlags::default(),
+                    ))],
+                    "inbox-delta-initial-trash",
+                )],
+            ),
+            (
+                "deleted-items-id".into(),
+                vec![final_page(vec![], "deleted-delta-initial-trash")],
+            ),
+        ]),
+        HashMap::from([("message-id".into(), vec![Ok(b"message".to_vec())])]),
+    );
+    CloudSynchronizer::new(&initial_graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("initial synchronization should succeed");
+    let stored = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    let desired_flags = MessageFlags {
+        is_read: true,
+        follow_up: FollowUpState::Flagged,
+    };
+    let trashed_path = format!("Inbox/cur/{}:2,FST", stored.maildir_key);
+    std::fs::rename(
+        account.maildir.join(&stored.relative_path),
+        account.maildir.join(&trashed_path),
+    )
+    .expect("message should receive the Maildir trash flag");
+    let graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-local-trash")],
+        HashMap::from([
+            (
+                "inbox-id".into(),
+                vec![final_page(
+                    vec![DeltaChange::Delete {
+                        id: "message-id".into(),
+                    }],
+                    "inbox-delta-local-trash",
+                )],
+            ),
+            (
+                "deleted-items-id".into(),
+                vec![final_page(
+                    vec![DeltaChange::Upsert(build_message(
+                        "message-id",
+                        "deleted-items-id",
+                        "version-2",
+                        desired_flags,
+                    ))],
+                    "deleted-delta-local-trash",
+                )],
+            ),
+        ]),
+        HashMap::new(),
+    );
+
+    let summary = CloudSynchronizer::new(&graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("local trash should synchronize");
+
+    assert_eq!(summary.local_trashed, 1);
+    assert_eq!(summary.local_flag_updates, 1);
+    assert_eq!(graph.deleted_items_lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *graph.moves.lock().expect("moves should be readable"),
+        [("message-id".into(), "deleted-items-id".into())]
+    );
+    let synchronized = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    assert_eq!(synchronized.folder_id, "deleted-items-id");
+    assert_eq!(synchronized.flags, desired_flags);
+    assert!(synchronized.relative_path.starts_with("Deleted Items/cur/"));
+    assert!(!account.maildir.join(trashed_path).exists());
+}
+
+#[tokio::test]
+async fn permanently_deletes_a_locally_removed_deleted_items_message() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    let initial_graph = FakeGraph::new(
+        [final_page(
+            vec![DeltaChange::Upsert(build_folder(
+                "deleted-items-id",
+                None,
+                "Deleted Items",
+            ))],
+            "folder-delta-initial-delete",
+        )],
+        HashMap::from([(
+            "deleted-items-id".into(),
+            vec![final_page(
+                vec![DeltaChange::Upsert(build_message(
+                    "message-id",
+                    "deleted-items-id",
+                    "version-1",
+                    MessageFlags::default(),
+                ))],
+                "deleted-delta-initial-delete",
+            )],
+        )]),
+        HashMap::from([("message-id".into(), vec![Ok(b"message".to_vec())])]),
+    );
+    CloudSynchronizer::new(&initial_graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("initial synchronization should succeed");
+    let stored = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    maildir
+        .remove_message(&stored.relative_path)
+        .expect("message should be removed locally");
+    let graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-local-delete")],
+        HashMap::from([(
+            "deleted-items-id".into(),
+            vec![final_page(
+                vec![DeltaChange::Delete {
+                    id: "message-id".into(),
+                }],
+                "deleted-delta-local-delete",
+            )],
+        )]),
+        HashMap::new(),
+    );
+
+    let summary = CloudSynchronizer::new(&graph)
+        .sync_account(&account, &mut state, &maildir, false)
+        .await
+        .expect("local permanent deletion should synchronize");
+
+    assert_eq!(summary.local_deleted, 1);
+    assert_eq!(
+        *graph.deletes.lock().expect("deletes should be readable"),
+        ["message-id"]
+    );
+    assert!(
+        state
+            .get_message("work", "message-id")
+            .expect("message should load")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn defers_a_missing_baseline_when_an_untracked_replacement_is_ambiguous() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let account = build_account(temp.path());
+    let mut state = StateDatabase::open(&temp.path().join("state.sqlite3"))
+        .expect("state database should open");
+    let maildir = MaildirStore::new(&account.maildir);
+    synchronize_initial_message(&account, &mut state, &maildir).await;
+    let stored = state
+        .get_message("work", "message-id")
+        .expect("message should load")
+        .expect("message should exist");
+    std::fs::rename(
+        account.maildir.join(&stored.relative_path),
+        account.maildir.join("Inbox/new/rewritten-key"),
+    )
+    .expect("mail client should rewrite the deterministic key");
+    let graph = FakeGraph::new(
+        [final_page(vec![], "folder-delta-rewritten-key")],
+        HashMap::from([(
+            "inbox-id".into(),
+            vec![final_page(vec![], "message-delta-rewritten-key")],
+        )]),
+        HashMap::new(),
+    );
+
+    let summary = CloudSynchronizer::new(&graph)
+        .sync_account(&account, &mut state, &maildir, true)
+        .await
+        .expect("ambiguous replacement should be deferred safely");
+
+    assert_eq!(summary.local_trashed, 0);
+    assert_eq!(summary.local_ignored, 1);
+    assert!(graph.moves.lock().expect("moves should load").is_empty());
+    assert!(
+        state
+            .list_pending_location_operations("work")
+            .expect("journal should load")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn classifies_unsupported_local_changes_without_remote_mutation() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let account = build_account(temp.path());
@@ -700,7 +1098,9 @@ async fn classifies_unsupported_local_changes_without_remote_mutation() {
         .expect("dry-run should classify unsupported local changes");
 
     assert_eq!(summary.local_flag_updates, 0);
-    assert_eq!(summary.local_ignored, 4);
+    assert_eq!(summary.local_moves, 1);
+    assert_eq!(summary.local_trashed, 1);
+    assert_eq!(summary.local_ignored, 2);
     assert!(
         reporter
             .events
@@ -708,8 +1108,9 @@ async fn classifies_unsupported_local_changes_without_remote_mutation() {
             .expect("progress events should load")
             .contains(&SyncProgress::LocalScanCompleted {
                 flag_updates: 0,
-                moved: 1,
-                missing: 1,
+                moves: 1,
+                trashed: 1,
+                deleted: 0,
                 duplicates: 1,
                 edited: 1,
             })
@@ -721,6 +1122,7 @@ async fn classifies_unsupported_local_changes_without_remote_mutation() {
             .expect("flag updates should load")
             .is_empty()
     );
+    assert!(graph.moves.lock().expect("moves should load").is_empty());
 }
 
 #[tokio::test]
@@ -1058,6 +1460,9 @@ async fn dry_run_plans_changes_without_downloading_or_mutating_local_state() {
             deleted: 0,
             conflicted: 0,
             local_flag_updates: 0,
+            local_moves: 0,
+            local_trashed: 0,
+            local_deleted: 0,
             local_ignored: 0,
         }
     );

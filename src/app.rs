@@ -14,7 +14,8 @@ use crate::init::{
 use crate::maildir::MaildirStore;
 use crate::state::{AccountLock, StateDatabase, StateError, get_account_lock_path};
 use crate::sync::{
-    CloudSynchronizer, SyncActionKind, SyncError, SyncProgress, SyncProgressReporter, SyncSummary,
+    CloudSynchronizer, LocalLocationActionKind, SyncActionKind, SyncError, SyncProgress,
+    SyncProgressReporter, SyncSummary,
 };
 use directories::BaseDirs;
 use std::path::Path;
@@ -216,13 +217,32 @@ fn get_sync_progress_message(progress: &SyncProgress, verbose: bool) -> Option<S
         )),
         SyncProgress::LocalScanCompleted {
             flag_updates,
-            moved,
-            missing,
+            moves,
+            trashed,
+            deleted,
             duplicates,
             edited,
         } => Some(format!(
-            "local scan complete: {flag_updates} flag updates, {moved} moves deferred, {missing} missing, {duplicates} duplicate, {edited} edited"
+            "local scan complete: {flag_updates} flag updates, {moves} moves, {trashed} trash, {deleted} permanent deletes, {duplicates} duplicate, {edited} edited"
         )),
+        SyncProgress::LocalLocationApplyStarted { total } => {
+            Some(format!("submitting {total} local move/trash/delete operations"))
+        }
+        SyncProgress::LocalLocationApplyProgress {
+            position,
+            total,
+            action,
+        } if verbose || *position == 1 || *position == *total || *position % 100 == 0 => {
+            let action = match action {
+                LocalLocationActionKind::Move => "move",
+                LocalLocationActionKind::Trash => "trash",
+                LocalLocationActionKind::Delete => "delete",
+            };
+            Some(format!(
+                "submitting local {action} operation {position}/{total}"
+            ))
+        }
+        SyncProgress::LocalLocationApplyProgress { .. } => None,
         SyncProgress::LocalFlagApplyStarted { total } => {
             Some(format!("submitting {total} local flag updates"))
         }
@@ -350,12 +370,15 @@ fn show_sync_summary(account: &str, summary: SyncSummary, dry_run: bool) {
         "synchronized"
     };
     println!(
-        "Account '{account}' {qualifier} {} folders: {} created, {} updated, {} deleted, {} conflicts, {} local flag updates, {} local changes deferred.",
+        "Account '{account}' {qualifier} {} folders: {} created, {} updated, {} deleted, {} conflicts, {} local moves, {} local trash, {} local permanent deletes, {} local flag updates, {} local changes deferred.",
         summary.folders,
         summary.created,
         summary.updated,
         summary.deleted,
         summary.conflicted,
+        summary.local_moves,
+        summary.local_trashed,
+        summary.local_deleted,
         summary.local_flag_updates,
         summary.local_ignored,
     );
@@ -364,7 +387,7 @@ fn show_sync_summary(account: &str, summary: SyncSummary, dry_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::{get_safe_log_value, get_sync_progress_message};
-    use crate::sync::SyncProgress;
+    use crate::sync::{LocalLocationActionKind, SyncProgress};
 
     #[test]
     fn renders_normal_and_verbose_progress_at_the_expected_detail_levels() {
@@ -415,8 +438,9 @@ mod tests {
             get_sync_progress_message(
                 &SyncProgress::LocalScanCompleted {
                     flag_updates: 4,
-                    moved: 2,
-                    missing: 1,
+                    moves: 2,
+                    trashed: 1,
+                    deleted: 1,
                     duplicates: 0,
                     edited: 3,
                 },
@@ -424,8 +448,20 @@ mod tests {
             )
             .as_deref(),
             Some(
-                "local scan complete: 4 flag updates, 2 moves deferred, 1 missing, 0 duplicate, 3 edited"
+                "local scan complete: 4 flag updates, 2 moves, 1 trash, 1 permanent deletes, 0 duplicate, 3 edited"
             )
+        );
+        assert_eq!(
+            get_sync_progress_message(
+                &SyncProgress::LocalLocationApplyProgress {
+                    position: 1,
+                    total: 3,
+                    action: LocalLocationActionKind::Trash,
+                },
+                false,
+            )
+            .as_deref(),
+            Some("submitting local trash operation 1/3")
         );
         assert!(
             get_sync_progress_message(

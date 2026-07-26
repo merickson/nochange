@@ -36,6 +36,17 @@ pub struct ScannedMessage {
     pub relative_path: String,
     /// Supported flags parsed from the Maildir filename.
     pub flags: MessageFlags,
+    /// Whether the local Maildir filename contains the trash (`T`) flag.
+    pub is_trashed: bool,
+}
+
+/// One managed-Maildir scan split into correlated and untracked files.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedMaildirScan {
+    /// Files correlated by Nochange's deterministic tracked keys.
+    pub tracked: BTreeMap<String, Vec<ScannedMessage>>,
+    /// Number of files whose keys do not match a tracked baseline.
+    pub untracked: usize,
 }
 
 /// Filesystem adapter rooted at one configured account Maildir.
@@ -70,7 +81,18 @@ impl MaildirStore {
         local_paths: &[String],
         tracked_keys: &BTreeSet<String>,
     ) -> Result<BTreeMap<String, Vec<ScannedMessage>>, MaildirError> {
-        let mut scanned: BTreeMap<String, Vec<ScannedMessage>> = BTreeMap::new();
+        Ok(self
+            .scan_managed_messages(local_paths, tracked_keys)?
+            .tracked)
+    }
+
+    /// Scan selected folders while also counting untracked ambiguity.
+    pub fn scan_managed_messages(
+        &self,
+        local_paths: &[String],
+        tracked_keys: &BTreeSet<String>,
+    ) -> Result<ManagedMaildirScan, MaildirError> {
+        let mut scan = ManagedMaildirScan::default();
         for local_path in local_paths {
             for subdirectory in ["new", "cur"] {
                 let directory = self.get_safe_path(local_path)?.join(subdirectory);
@@ -85,9 +107,10 @@ impl MaildirStore {
                         .map_err(|_| MaildirError::UnsafePath)?;
                     let (maildir_key, flags) = split_maildir_name(&file_name);
                     if !tracked_keys.contains(maildir_key) {
+                        scan.untracked += 1;
                         continue;
                     }
-                    scanned
+                    scan.tracked
                         .entry(maildir_key.to_owned())
                         .or_default()
                         .push(ScannedMessage {
@@ -100,14 +123,15 @@ impl MaildirStore {
                                     FollowUpState::NotFlagged
                                 },
                             },
+                            is_trashed: flags.contains('T'),
                         });
                 }
             }
         }
-        for messages in scanned.values_mut() {
+        for messages in scan.tracked.values_mut() {
             messages.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         }
-        Ok(scanned)
+        Ok(scan)
     }
 
     /// Hash one safely resolved managed message for local-edit detection.
@@ -299,6 +323,38 @@ impl MaildirStore {
         Ok(destination_relative)
     }
 
+    /// Move one clean tracked file to another managed Maildir and apply cloud flags.
+    pub fn move_tracked(
+        &self,
+        current_relative_path: &str,
+        target_local_path: &str,
+        baseline_hash: &str,
+        maildir_key: &str,
+        flags: MessageFlags,
+    ) -> Result<String, MaildirError> {
+        validate_maildir_key(maildir_key)?;
+        let current = self.get_safe_path(current_relative_path)?;
+        if !current.is_file() || get_file_hash(&current)? != baseline_hash {
+            return Err(MaildirError::TrackedContentChanged);
+        }
+        let preserved_flags = get_preserved_flags(&current)?;
+        let destination_relative =
+            get_message_relative_path(target_local_path, maildir_key, flags, &preserved_flags);
+        if destination_relative == current_relative_path {
+            return Ok(destination_relative);
+        }
+        let destination = self.get_safe_path(&destination_relative)?;
+        if destination.exists() {
+            return Err(MaildirError::DestinationCollision {
+                relative_path: destination_relative,
+            });
+        }
+        fs::rename(&current, &destination)?;
+        sync_directory(current.parent(), self.fsync_enabled)?;
+        sync_directory(destination.parent(), self.fsync_enabled)?;
+        Ok(destination_relative)
+    }
+
     /// Remove one tracked message idempotently without permitting path escape.
     pub fn remove_message(&self, relative_path: &str) -> Result<(), MaildirError> {
         let path = self.get_safe_path(relative_path)?;
@@ -437,6 +493,9 @@ pub enum MaildirError {
         /// Account-root-relative colliding path.
         relative_path: String,
     },
+    /// A tracked message changed after its synchronized MIME baseline.
+    #[error("a tracked Maildir message changed locally")]
+    TrackedContentChanged,
     /// No unused conflict filename remained in the supported sequence range.
     #[error("could not allocate a unique Maildir conflict filename")]
     ConflictExhausted,
