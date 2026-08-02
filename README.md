@@ -5,21 +5,210 @@ Maildirs and sending mail through a sendmail-compatible interface. It uses the
 Microsoft Graph v1.0 REST API and delegated access to the signed-in user's
 primary mailbox.
 
-The Graph-based rewrite is under active development. `nochange init`
-authenticates and verifies the configured Microsoft 365 identity, and
-`nochange sync` now performs incremental cloud-to-local synchronization.
-Local read/follow-up flags, managed-folder moves, trash, and permanent deletion
-from Deleted Items synchronize back to Graph. Outbound RFC messages can be
-submitted through a sendmail-compatible command.
+This project is inspired by [lieer](https://lieer.gaute.vetsj.com/)
+for GMail, and is designed to provide capability similar to the
+pairing of OfflineIMAP and msmtp. Unlike lieer, we don't integrate
+into a MUA, but simply sync to a maildir.
 
-## Build
+## Using nochange
 
-Nochange uses the Rust 2024 edition. Build and test it with Cargo:
+### Prerequisites
+
+* macOS or Linux. Not tested on Windows (yet). 
+* Rust 2024 or later.
+
+### Install
+
+Just use Cargo. From the root of the git checkout:
 
 ```console
-cargo build
-cargo test --workspace --all-features
+cargo install --path=.
 ```
+
+### Configuration
+
+The default configuration path is
+`$XDG_CONFIG_HOME/nochange/nochange.conf`, defaulting  to
+`~/.config/nochange/nochange.conf`.
+
+```ini
+[global]
+accounts = o365_1
+
+[o365_1]
+maildir = ~/maildir/o365_1
+user = myuser@contoso.com
+clientid = application-client-id
+tenant = organizations
+folderseparator = .
+folderexclude = Journal,Notes,Calendar
+```
+
+* `accounts`: A comma-separated list of accounts.
+* `maildir`: Per-account maildir
+* `user`: Your Microsoft 365 user, of the form `<user>@<domain>`.
+* `clientid`: The nochange client ID. It supports using a separate one per account so you can configure it for your Entra if necessary (see below).
+* `tenant`: Leave blank if using the default Client ID (below), otherwise configure for your Entra tenant.
+* `folderseparator`: defaults to `.`, matching OfflineIMAP behavior.
+* `folderinclude` | `folderexclude`: Comma-separated list of folders. Either an allow list or deny list, they are mutually exclusive.
+
+Nochange rejects client secrets, unknown settings, repeated accounts,
+overlapping account Maildir roots, and unsafe folder separators.
+
+#### ClientID
+
+You can use the default Client ID of
+`13924670-7ce9-480d-90c3-bfbaed21a227`, which is registered by Soul
+Robotic (my personal domain) to 'No Change'. If you use this, do **not** specify a `tenant`.
+
+Otherwise, please see **Microsoft Entra setup** (below).
+
+### Log in
+
+Ensure that you have your configuration setup.
+
+Login with `nochange init --account <account>` for each account you have configured.
+
+You may need to make sure your browser is already logged into the
+right account if you are trying to authenticate to multiple accounts
+with nochange. Simplest way forward is making sure you're logged into
+the Outlook webapp with the right account when you run `nochange
+init`.
+
+Nochange prints the authorization URL before opening the system
+browser. After the localhost callback then stores the refresh token in
+the operating system credential store. **On macOS** you will be
+prompted to allow nochange access to the keychain for the first time
+that build tries to read from it. Select "Always Allowed" to not be
+bothered by it in the future.
+
+For a terminal without a usable local browser, use device authorization:
+
+```console
+nochange init --account o365_1 --device-code
+```
+
+Visit the displayed Microsoft URL and enter the displayed code. A successful
+trial ends with:
+
+```text
+Account 'o365_1' authenticated as myuser@contoso.com.
+```
+
+### Synchronize mail
+
+Preview the selected folders and message changes without downloading MIME or
+changing Maildirs and checkpoints:
+
+```console
+nochange sync --dry-run
+```
+
+Then perform the cloud-to-local synchronization:
+
+```console
+nochange sync
+```
+
+You can specify `--account <account_name>` to act only on one account.
+
+### Sending Mail
+
+`nochange send` provides a `sendmail`-style interface to send messages
+through the command line:
+
+```console
+printf 'From: myuser@contoso.com\nTo: recipient@contoso.com\nSubject: Test\n\nHello.\n' \
+  | nochange send -a o365_1 -t
+```
+
+Several `sendmail` options are accepted purely for sendmail
+compatibility and are not actually used.
+
+## CLI
+
+```text
+nochange [--config PATH] [--verbose] <COMMAND>
+
+nochange init [--account NAME] [--device-code]
+nochange sync [--account NAME] [--dry-run] [--no-fsync]
+nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-o] [-i] [--] [RECIPIENT...]
+```
+
+### Init
+
+`init` authenticates and verifies the mailbox identity. See "Log In" above.
+
+### Sync
+
+`sync` discovers and summarizes cloud-to-local actions. See
+"Synchronize Mail" above.
+
+Synchronization writes timestamped status lines to standard error while it
+authenticates, enumerates folder and message delta pages, and applies local
+actions. Normal output shows every requested page and each folder's completion.
+During an initial sync, it also uses Graph's current folder item count to show
+an explicitly approximate per-folder percentage; the final delta link remains
+the authoritative completion signal. Incremental rounds omit this estimate
+because total folder size does not predict the number of changes.
+
+Add the global `--verbose` option for returned page counts and every message
+action:
+
+```console
+target/debug/nochange --verbose sync --account o365_1 --dry-run
+```
+
+Status output contains account and folder names, counts, and action kinds. It
+does not contain message IDs, subjects, message bodies, delta links, or tokens.
+
+#### Disable Fsync
+
+For a faster initial import, explicitly disable filesystem durability barriers
+for only that invocation:
+
+```console
+nochange sync --no-fsync
+```
+
+This sets SQLite synchronous mode to `OFF` and skips MIME-file and Maildir
+directory `fsync` calls. A crash, power loss, forced restart, or storage failure
+can therefore lose or corrupt local Maildir and synchronization-state data.
+Nochange prints a warning when this mode is active. The next invocation returns
+to full durability unless `--no-fsync` is supplied again.
+
+### Send
+
+`send` reads one complete RFC message from standard input.
+
+The Graph API returning `202 Accepted` means Microsoft accepted the message for
+processing; it does not prove final delivery. Successful sends produce no
+terminal output; validation or submission failures are written to standard
+error and use the documented sendmail-compatible exit codes.
+
+Without `-a`, `send` selects the unique configured account whose `user`
+matches the message's `From` and optional `Sender` address case-insensitively.
+If no account matches, sending is rejected; if multiple accounts use that same
+address, `-a` is required. `From` and optional `Sender` must name the selected
+account's configured `user` address. Aliases and delegated send-as are not
+supported yet.
+
+With `-t`, recipients are taken from the union of `To`, `Cc`, `Bcc`, and the
+command line. Without `-t`, at least one command-line recipient is required and
+every header recipient must also appear on the command line. Command-line
+recipients absent from the headers are added as `Bcc` before submission. The
+message must include a valid header/body separator. `-o`, `-i`, grouped `-oi`,
+and `-f ADDRESS` are accepted compatibility no-ops. The `-f` address does not
+affect account or sender selection, and a line containing only `.` is never
+treated specially.
+
+Message validation retains only the bounded header block in memory. The input
+and its base64 Graph payload are streamed through secure temporary files, and
+unrelated MIME headers, attachments, transfer encodings, and body bytes are
+not reserialized. An explicit throttling or transient Graph rejection is
+retried. A network failure after submission begins reports `EX_TEMPFAIL` with
+an unknown-result warning and is not automatically replayed, because Graph may
+already have accepted the message and a replay could create a duplicate.
 
 ## Microsoft Entra setup
 
@@ -50,118 +239,14 @@ minimum identity scopes needed to verify the signed-in account. The initial
 release targets commercial Microsoft 365 only; shared mailboxes, delegated
 mailboxes, aliases, and sovereign clouds are outside its initial scope.
 
-## Configuration
+## Sync Process
 
-The default configuration path is
-`$XDG_CONFIG_HOME/nochange/nochange.conf`, falling back to
-`~/.config/nochange/nochange.conf`. Synchronization state is stored at
-`$XDG_STATE_HOME/nochange/state.sqlite3`, falling back to
-`~/.local/state/nochange/state.sqlite3`.
-
-```ini
-[global]
-accounts = o365_1
-
-[o365_1]
-maildir = ~/maildir/o365_1
-user = myuser@contoso.com
-clientid = application-client-id
-tenant = organizations
-folderseparator = .
-folderexclude = Journal,Notes,Calendar
-```
-
-`accounts`, `maildir`, `user`, and `clientid` are required. `tenant` defaults
-to `organizations`, and `folderseparator` defaults to `.`. Folder filters are
-case-insensitive, use `/`-delimited full remote paths, and select or exclude
-the named folder's complete subtree. `folderinclude` and `folderexclude` cannot
-be used together.
-
-Nochange rejects client secrets, unknown settings, repeated accounts,
-overlapping account Maildir roots, and unsafe folder separators.
-
-## Log in
-
-Replace `user`, `clientid`, and `tenant` in `nochange.conf`. `user` must be the
-mailbox's Microsoft Entra user principal name, and `tenant` may be the recorded
-Directory (tenant) ID.
-
-Build and start browser login:
-
-```console
-cargo build
-target/debug/nochange --config ./nochange.conf init --account o365_1
-```
-
-Nochange prints the authorization URL before opening the system browser. After
-the localhost callback, it calls Microsoft Graph `/me`, confirms that the
-returned user principal name matches `user`, and only then stores the refresh
-token in the operating system credential store.
-
-For a terminal without a usable local browser, use device authorization:
-
-```console
-target/debug/nochange --config ./nochange.conf init --account o365_1 --device-code
-```
-
-Visit the displayed Microsoft URL and enter the displayed code. A successful
-trial ends with:
-
-```text
-Account 'o365_1' authenticated as myuser@contoso.com.
-```
-
-## Synchronize mail
-
-Preview the selected folders and message changes without downloading MIME or
-changing Maildirs and checkpoints:
-
-```console
-target/debug/nochange --config ./nochange.conf sync --account o365_1 --dry-run
-```
-
-Then perform the cloud-to-local synchronization:
-
-```console
-target/debug/nochange --config ./nochange.conf sync --account o365_1
-```
-
-For a faster initial import, explicitly disable filesystem durability barriers
-for only that invocation:
-
-```console
-target/debug/nochange --config ./nochange.conf sync --account o365_1 --no-fsync
-```
-
-This sets SQLite synchronous mode to `OFF` and skips MIME-file and Maildir
-directory `fsync` calls. A crash, power loss, forced restart, or storage failure
-can therefore lose or corrupt local Maildir and synchronization-state data.
-Nochange prints a warning when this mode is active. The next invocation returns
-to full durability unless `--no-fsync` is supplied again.
-
-Synchronization writes timestamped status lines to standard error while it
-authenticates, enumerates folder and message delta pages, and applies local
-actions. Normal output shows every requested page and each folder's completion.
-During an initial sync, it also uses Graph's current folder item count to show
-an explicitly approximate per-folder percentage; the final delta link remains
-the authoritative completion signal. Incremental rounds omit this estimate
-because total folder size does not predict the number of changes.
-Add the global `--verbose` option for returned page counts and every message
-action:
-
-```console
-target/debug/nochange --verbose sync --account o365_1 --dry-run
-```
-
-Status output contains account and folder names, counts, and action kinds. It
-does not contain message IDs, subjects, message bodies, delta links, or tokens.
-
-Omit `--account` to process all configured accounts serially. The first run
-creates private Maildirs under the configured account root and downloads each
-selected folder's complete history. MIME transfer uses up to four concurrent
-downloads, followed by deterministic local commits. Later runs resume from
-opaque Microsoft Graph delta links. A failed or interrupted round leaves its
-message checkpoint unchanged, so it can be replayed without re-downloading
+The first run creates private Maildirs under the configured account
+root and downloads each selected folder's complete history. MIME
+transfer uses up to four concurrent downloads, followed by
+deterministic local commits. Later runs resume from opaque Microsoft
+Graph delta links. A failed or interrupted round leaves its message
+checkpoint unchanged, so it can be replayed without re-downloading
 already committed versions.
 
 Maildir folder names preserve ordinary spaces, Unicode, and readable
@@ -189,56 +274,6 @@ keys, locally edited MIME, moves that rewrite Nochange's deterministic key, and
 untracked local messages remain deferred and are not uploaded. If cloud state
 replaces or deletes locally edited tracked MIME, Nochange preserves the local
 bytes in `.nochange-conflicts` before applying the cloud result.
-
-## CLI
-
-```text
-nochange [--config PATH] [--verbose] <COMMAND>
-
-nochange init [--account NAME] [--device-code]
-nochange sync [--account NAME] [--dry-run] [--no-fsync]
-nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-o] [-i] [--] [RECIPIENT...]
-```
-
-`init` authenticates and verifies the mailbox identity. `sync --dry-run`
-discovers and summarizes cloud-to-local actions without downloading MIME or
-mutating Maildirs and synchronization checkpoints.
-
-`send` reads one complete RFC message from standard input. For example:
-
-```console
-printf 'From: myuser@contoso.com\nTo: recipient@contoso.com\nSubject: Test\n\nHello.\n' \
-  | nochange send -a o365_1 -t
-```
-
-The Graph API returning `202 Accepted` means Microsoft accepted the message for
-processing; it does not prove final delivery. Successful sends produce no
-terminal output; validation or submission failures are written to standard
-error and use the documented sendmail-compatible exit codes.
-
-Without `-a`, `send` selects the unique configured account whose `user`
-matches the message's `From` and optional `Sender` address case-insensitively.
-If no account matches, sending is rejected; if multiple accounts use that same
-address, `-a` is required. `From` and optional `Sender` must name the selected
-account's configured `user` address. Aliases and delegated send-as are not
-supported yet.
-
-With `-t`, recipients are taken from the union of `To`, `Cc`, `Bcc`, and the
-command line. Without `-t`, at least one command-line recipient is required and
-every header recipient must also appear on the command line. Command-line
-recipients absent from the headers are added as `Bcc` before submission. The
-message must include a valid header/body separator. `-o`, `-i`, grouped `-oi`,
-and `-f ADDRESS` are accepted compatibility no-ops. The `-f` address does not
-affect account or sender selection, and a line containing only `.` is never
-treated specially.
-
-Message validation retains only the bounded header block in memory. The input
-and its base64 Graph payload are streamed through secure temporary files, and
-unrelated MIME headers, attachments, transfer encodings, and body bytes are
-not reserialized. An explicit throttling or transient Graph rejection is
-retried. A network failure after submission begins reports `EX_TEMPFAIL` with
-an unknown-result warning and is not automatically replayed, because Graph may
-already have accepted the message and a replay could create a duplicate.
 
 ## Safety model
 
@@ -270,6 +305,3 @@ By default, SQLite, completed MIME files, and affected Maildir directories are
 synchronized durably before progress is committed. `sync --no-fsync` explicitly
 disables those guarantees for that invocation and should be treated as a
 recoverable-import optimization, not the normal operating mode.
-
-See [PLAN.md](PLAN.md) for the architecture, synchronization semantics,
-acceptance tests, and deferred work.
