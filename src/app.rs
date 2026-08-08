@@ -1,15 +1,16 @@
 //! Top-level command dispatch and concrete adapter wiring.
 
 use crate::auth::{
-    EntraEndpoints, EntraTokenExchange, KeyringCredentialStore, SystemBrowserLauncher, TokenManager,
+    AccessTokenProvider, AuthError, CommandAccessTokenProvider, EntraEndpoints, EntraTokenExchange,
+    KeyringCredentialStore, SystemBrowserLauncher, TokenManager,
 };
 use crate::cli::{Cli, Command, InitArgs, SendArgs, SyncArgs};
-use crate::config::{AccountSelection, AppConfig, AppPaths, ConfigError};
+use crate::config::{AccountConfig, AccountSelection, AppConfig, AppPaths, ConfigError};
 use crate::error::AppError;
 use crate::graph::{GraphError, GraphTransport, TokioSleeper};
 use crate::init::{
-    ConsoleLoginPrompter, EntraAccountAuthenticator, GraphProfileVerifier, InitRunner, LoginMethod,
-    ProfileVerifier,
+    ConsoleLoginPrompter, EntraAccountAuthenticator, GraphProfileVerifier, InitError, InitRunner,
+    LoginMethod, LoginPrompter, ProfileVerifier,
 };
 use crate::maildir::MaildirStore;
 use crate::send::{SendError, SendOptions, spool_message};
@@ -19,9 +20,48 @@ use crate::sync::{
     SyncProgressReporter, SyncSummary,
 };
 use directories::BaseDirs;
+use secrecy::SecretString;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+
+enum ConfiguredAccessTokenProvider {
+    Native(TokenManager<KeyringCredentialStore, EntraTokenExchange>),
+    Command(CommandAccessTokenProvider),
+}
+
+#[async_trait::async_trait]
+impl AccessTokenProvider for ConfiguredAccessTokenProvider {
+    async fn get_access_token(&self, force_refresh: bool) -> Result<SecretString, AuthError> {
+        match self {
+            Self::Native(provider) => provider.get_access_token(force_refresh).await,
+            Self::Command(provider) => provider.get_access_token(force_refresh).await,
+        }
+    }
+}
+
+fn build_access_token_provider(
+    account: &AccountConfig,
+) -> Result<Arc<ConfiguredAccessTokenProvider>, AuthError> {
+    if let Some(command) = account.token_command.as_ref() {
+        return Ok(Arc::new(ConfiguredAccessTokenProvider::Command(
+            CommandAccessTokenProvider::new(command),
+        )));
+    }
+    let client_id = account
+        .client_id
+        .as_deref()
+        .ok_or(AuthError::InvalidClientId)?;
+    let endpoints = EntraEndpoints::build(&account.tenant)?;
+    let exchange = Arc::new(EntraTokenExchange::build(client_id, &endpoints)?);
+    Ok(Arc::new(ConfiguredAccessTokenProvider::Native(
+        TokenManager::new(
+            account.name.clone(),
+            Arc::new(KeyringCredentialStore),
+            exchange,
+        ),
+    )))
+}
 
 /// Execute a parsed command with production adapters.
 pub async fn run(cli: Cli) -> Result<(), AppError> {
@@ -90,19 +130,9 @@ async fn run_send(config_override: Option<&Path>, arguments: &SendArgs) -> Resul
     .await
     .map_err(|_| AppError::Software("message preparation task failed".into()))??;
 
-    let endpoints = EntraEndpoints::build(&account.tenant)
+    let tokens = build_access_token_provider(account)
         .map_err(GraphError::from)
         .map_err(SendError::from)?;
-    let exchange = Arc::new(
-        EntraTokenExchange::build(&account.client_id, &endpoints)
-            .map_err(GraphError::from)
-            .map_err(SendError::from)?,
-    );
-    let tokens = Arc::new(TokenManager::new(
-        account.name.clone(),
-        Arc::new(KeyringCredentialStore),
-        exchange,
-    ));
     let access_token = tokens
         .get_access_token(false)
         .await
@@ -144,7 +174,12 @@ async fn run_init(config_override: Option<&Path>, arguments: &InitArgs) -> Resul
     let authenticator = Arc::new(EntraAccountAuthenticator::new(SystemBrowserLauncher));
     let profiles = Arc::new(GraphProfileVerifier);
     let prompter = Arc::new(ConsoleLoginPrompter);
-    let runner = InitRunner::new(credentials, authenticator, profiles, prompter);
+    let runner = InitRunner::new(
+        credentials,
+        authenticator,
+        Arc::clone(&profiles),
+        Arc::clone(&prompter),
+    );
     let method = if arguments.device_code {
         LoginMethod::DeviceCode
     } else {
@@ -152,7 +187,31 @@ async fn run_init(config_override: Option<&Path>, arguments: &InitArgs) -> Resul
     };
 
     for account in accounts {
-        runner.initialize_account(account, method).await?;
+        if account.token_command.is_some() {
+            let tokens = build_access_token_provider(account).map_err(InitError::from)?;
+            let access_token = tokens
+                .get_access_token(false)
+                .await
+                .map_err(InitError::from)?;
+            let identity = profiles
+                .get_profile(&access_token)
+                .await
+                .map_err(InitError::from)?;
+            if !identity
+                .user_principal_name
+                .eq_ignore_ascii_case(&account.user)
+            {
+                return Err(InitError::IdentityMismatch {
+                    account: account.name.clone(),
+                    expected: account.user.clone(),
+                    actual: identity.user_principal_name,
+                }
+                .into());
+            }
+            prompter.show_authenticated(&account.name, &identity.user_principal_name);
+        } else {
+            runner.initialize_account(account, method).await?;
+        }
     }
     Ok(())
 }
@@ -179,7 +238,6 @@ async fn run_sync(
     let fsync_enabled = !arguments.no_fsync;
     let mut state = StateDatabase::open_with_fsync(&paths.state_database, fsync_enabled)
         .map_err(SyncError::from)?;
-    let credentials = Arc::new(KeyringCredentialStore);
     let profiles = GraphProfileVerifier;
     let mut failures = Vec::new();
 
@@ -195,16 +253,7 @@ async fn run_sync(
             let lock_path = get_account_lock_path(state_root, &account.name);
             let _lock = AccountLock::acquire(&lock_path)?;
             reporter.show_status("refreshing credentials and verifying mailbox identity");
-            let endpoints = EntraEndpoints::build(&account.tenant).map_err(GraphError::from)?;
-            let exchange = Arc::new(
-                EntraTokenExchange::build(&account.client_id, &endpoints)
-                    .map_err(GraphError::from)?,
-            );
-            let tokens = Arc::new(TokenManager::new(
-                account.name.clone(),
-                Arc::clone(&credentials),
-                exchange,
-            ));
+            let tokens = build_access_token_provider(account).map_err(GraphError::from)?;
             let access_token = tokens
                 .get_access_token(false)
                 .await

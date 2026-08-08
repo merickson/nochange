@@ -14,6 +14,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "maildir",
     "user",
     "clientid",
+    "tokencommand",
     "tenant",
     "folderseparator",
     "folderinclude",
@@ -106,7 +107,9 @@ pub struct AccountConfig {
     /// Expected Microsoft 365 user identity.
     pub user: String,
     /// Microsoft Entra public-client application identifier.
-    pub client_id: String,
+    pub client_id: Option<String>,
+    /// External executable that prints one Microsoft Graph access token.
+    pub token_command: Option<PathBuf>,
     /// Microsoft Entra tenant name or identifier.
     pub tenant: String,
     /// Character used to flatten the remote folder hierarchy.
@@ -173,7 +176,21 @@ impl AppConfig {
             let maildir =
                 resolve_maildir_path(maildir_value, home_dir, config_parent, &account_name)?;
             let user = get_required(section, &account_name, "user")?.to_owned();
-            let client_id = get_required(section, &account_name, "clientid")?.to_owned();
+            let client_id = get_optional(section, "clientid").map(str::to_owned);
+            let token_command = get_optional(section, "tokencommand")
+                .map(|value| {
+                    resolve_token_command_path(value, home_dir, config_parent, &account_name)
+                })
+                .transpose()?;
+            match (&client_id, &token_command) {
+                (None, None) => {
+                    return Err(ConfigError::MissingAuthentication(account_name));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(ConfigError::ConflictingAuthentication(account_name));
+                }
+                _ => {}
+            }
             let tenant = get_optional(section, "tenant")
                 .unwrap_or("organizations")
                 .to_owned();
@@ -188,6 +205,7 @@ impl AppConfig {
                 maildir,
                 user,
                 client_id,
+                token_command,
                 tenant,
                 folder_separator,
                 folder_filter,
@@ -264,6 +282,12 @@ pub enum ConfigError {
     /// A public-client configuration attempted to provide a client secret.
     #[error("account '{0}' contains forbidden key 'clientsecret'")]
     ClientSecret(String),
+    /// Neither supported authentication mechanism was configured.
+    #[error("account '{0}' must set exactly one of clientid or tokencommand")]
+    MissingAuthentication(String),
+    /// Both supported authentication mechanisms were configured.
+    #[error("account '{0}' cannot set both clientid and tokencommand")]
+    ConflictingAuthentication(String),
     /// Folder selection modes were both configured.
     #[error("account '{0}' cannot set both folderinclude and folderexclude")]
     ConflictingFolderFilters(String),
@@ -281,6 +305,14 @@ pub enum ConfigError {
         /// Account with the invalid path.
         account: String,
         /// Actionable path diagnostic.
+        message: String,
+    },
+    /// A configured external token command path is invalid.
+    #[error("invalid token command path for account '{account}': {message}")]
+    InvalidTokenCommandPath {
+        /// Account with the invalid setting.
+        account: String,
+        /// Filesystem diagnostic without secret material.
         message: String,
     },
     /// Two account roots are identical or nested.
@@ -453,6 +485,36 @@ fn resolve_maildir_path(
     };
     let absolute = std::path::absolute(expanded)?;
     canonicalize_maildir_path(&absolute, account)
+}
+
+fn resolve_token_command_path(
+    configured: &str,
+    home_dir: &Path,
+    config_parent: &Path,
+    account: &str,
+) -> Result<PathBuf, ConfigError> {
+    let configured_path = Path::new(configured);
+    let expanded = if configured_path == Path::new("~") {
+        home_dir.to_path_buf()
+    } else if let Ok(remainder) = configured_path.strip_prefix("~") {
+        home_dir.join(remainder)
+    } else if configured.starts_with('~') {
+        return Err(ConfigError::InvalidTokenCommandPath {
+            account: account.to_owned(),
+            message: "only '~' and '~/' home expansions are supported".into(),
+        });
+    } else if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        config_parent.join(configured_path)
+    };
+    let absolute = std::path::absolute(expanded)?;
+    canonicalize_nonexistent(&normalize_path(&absolute)).map_err(|error| {
+        ConfigError::InvalidTokenCommandPath {
+            account: account.to_owned(),
+            message: error.to_string(),
+        }
+    })
 }
 
 fn canonicalize_maildir_path(path: &Path, account: &str) -> Result<PathBuf, ConfigError> {

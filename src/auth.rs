@@ -9,6 +9,8 @@ use oauth2::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -476,6 +478,78 @@ pub trait AccessTokenProvider: Send + Sync {
     async fn get_access_token(&self, force_refresh: bool) -> Result<SecretString, AuthError>;
 }
 
+/// Access-token provider backed by an external executable.
+///
+/// The executable receives `NOCHANGE_FORCE_REFRESH=1` after an HTTP 401 and
+/// must print exactly one whitespace-free access token to standard output.
+pub struct CommandAccessTokenProvider {
+    command: PathBuf,
+    cached_access_token: Mutex<Option<SecretString>>,
+}
+
+impl CommandAccessTokenProvider {
+    /// Construct a provider that invokes `command` without shell expansion.
+    pub fn new(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: command.into(),
+            cached_access_token: Mutex::new(None),
+        }
+    }
+
+    async fn execute(&self, force_refresh: bool) -> Result<SecretString, AuthError> {
+        let command = self.command.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(command)
+                .env(
+                    "NOCHANGE_FORCE_REFRESH",
+                    if force_refresh { "1" } else { "0" },
+                )
+                .stdin(Stdio::null())
+                .stderr(Stdio::inherit())
+                .output()
+        })
+        .await
+        .map_err(|_| AuthError::TokenCommandTask)?
+        .map_err(|_| AuthError::TokenCommandUnavailable)?;
+        if !output.status.success() {
+            return Err(AuthError::TokenCommandFailed);
+        }
+        parse_token_command_output(&output.stdout)
+    }
+
+    /// Return the configured executable path without exposing token material.
+    pub fn command(&self) -> &Path {
+        &self.command
+    }
+}
+
+#[async_trait]
+impl AccessTokenProvider for CommandAccessTokenProvider {
+    async fn get_access_token(&self, force_refresh: bool) -> Result<SecretString, AuthError> {
+        let mut cached = self.cached_access_token.lock().await;
+        if !force_refresh && let Some(token) = cached.as_ref() {
+            return Ok(token.clone());
+        }
+        let token = self.execute(force_refresh).await?;
+        *cached = Some(token.clone());
+        Ok(token)
+    }
+}
+
+fn parse_token_command_output(output: &[u8]) -> Result<SecretString, AuthError> {
+    const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
+    if output.is_empty() || output.len() > MAX_ACCESS_TOKEN_BYTES {
+        return Err(AuthError::InvalidTokenCommandOutput);
+    }
+    let token = std::str::from_utf8(output)
+        .map_err(|_| AuthError::InvalidTokenCommandOutput)?
+        .trim();
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        return Err(AuthError::InvalidTokenCommandOutput);
+    }
+    Ok(SecretString::from(token))
+}
+
 /// Serializes token refresh, caches access tokens, and persists rotations.
 pub struct TokenManager<C, E> {
     account: String,
@@ -584,6 +658,18 @@ pub enum AuthError {
         /// Account requiring initialization.
         account: String,
     },
+    /// The configured access-token executable could not be started.
+    #[error("the configured access-token command is unavailable")]
+    TokenCommandUnavailable,
+    /// The access-token executable exited unsuccessfully.
+    #[error("the configured access-token command failed")]
+    TokenCommandFailed,
+    /// The blocking access-token command task could not complete.
+    #[error("the configured access-token command task failed")]
+    TokenCommandTask,
+    /// The executable did not print exactly one bounded access token.
+    #[error("the configured access-token command returned invalid output")]
+    InvalidTokenCommandOutput,
     /// Microsoft Entra rejected or could not complete a token exchange.
     #[error("Microsoft Entra token exchange failed")]
     TokenExchange,
@@ -673,8 +759,76 @@ fn parse_callback_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthError, parse_callback_target};
+    use super::{
+        AccessTokenProvider, AuthError, CommandAccessTokenProvider, parse_callback_target,
+        parse_token_command_output,
+    };
     use secrecy::{ExposeSecret, SecretString};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_provider_caches_tokens_and_reinvokes_after_unauthorized() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().expect("temporary directory should be created");
+        let counter = temp.path().join("calls");
+        let command = temp.path().join("token-command");
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$NOCHANGE_FORCE_REFRESH\" >> '{}'\nprintf 'token-%s\\n' \"$NOCHANGE_FORCE_REFRESH\"\n",
+                counter.display()
+            ),
+        )
+        .expect("token command should be writable");
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700))
+            .expect("token command should be executable");
+        let provider = CommandAccessTokenProvider::new(&command);
+
+        let first = provider
+            .get_access_token(false)
+            .await
+            .expect("initial command should succeed");
+        let cached = provider
+            .get_access_token(false)
+            .await
+            .expect("cached command should succeed");
+        let refreshed = provider
+            .get_access_token(true)
+            .await
+            .expect("forced command should succeed");
+
+        assert_eq!(first.expose_secret(), "token-0");
+        assert_eq!(cached.expose_secret(), "token-0");
+        assert_eq!(refreshed.expose_secret(), "token-1");
+        assert_eq!(
+            fs::read_to_string(counter).expect("call log should be readable"),
+            "0\n1\n"
+        );
+    }
+
+    #[test]
+    fn accepts_one_token_and_rejects_status_or_oversized_output() {
+        let token = parse_token_command_output(b"header.payload.signature\n")
+            .expect("one token line should be accepted");
+        assert_eq!(token.expose_secret(), "header.payload.signature");
+
+        for invalid in [
+            b"".as_slice(),
+            b"status\ntoken".as_slice(),
+            b"two tokens".as_slice(),
+        ] {
+            assert!(matches!(
+                parse_token_command_output(invalid),
+                Err(AuthError::InvalidTokenCommandOutput)
+            ));
+        }
+        assert!(matches!(
+            parse_token_command_output(&vec![b'x'; 64 * 1024 + 1]),
+            Err(AuthError::InvalidTokenCommandOutput)
+        ));
+    }
 
     #[test]
     fn accepts_ignored_callback_parameters_without_weakening_required_values() {

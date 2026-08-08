@@ -48,9 +48,25 @@ folderexclude = Journal,Notes,Calendar
 * `maildir`: Per-account maildir
 * `user`: Your Microsoft 365 user, of the form `<user>@<domain>`.
 * `clientid`: The nochange client ID. It supports using a separate one per account so you can configure it for your Entra if necessary (see below).
+* `tokencommand`: An executable path that prints one Microsoft Graph access
+  token. Use this instead of `clientid` when another tool owns OAuth refresh.
 * `tenant`: Leave blank if using the default Client ID (below), otherwise configure for your Entra tenant.
 * `folderseparator`: defaults to `.`, matching OfflineIMAP behavior.
 * `folderinclude` | `folderexclude`: Comma-separated list of folders. Either an allow list or deny list, they are mutually exclusive.
+
+`clientid` and `tokencommand` are mutually exclusive and one is required. The
+token command runs directly without a shell, is cached for the current process,
+and receives `NOCHANGE_FORCE_REFRESH=1` when Graph returns HTTP 401. It must
+print only the token to standard output. For example:
+
+```ini
+[o365_1]
+maildir = ~/maildir/o365_1
+user = myuser@contoso.com
+tokencommand = ~/.local/bin/my-graph-token
+folderseparator = .
+folderexclude = Journal,Notes,Calendar
+```
 
 Nochange rejects client secrets, unknown settings, repeated accounts,
 overlapping account Maildir roots, and unsafe folder separators.
@@ -68,6 +84,8 @@ Otherwise, please see **Microsoft Entra setup** (below).
 Ensure that you have your configuration setup.
 
 Login with `nochange init --account <account>` for each account you have configured.
+For a `tokencommand` account, `init` invokes that command and verifies `/me`;
+it does not start a browser or device-code flow and stores no credentials.
 
 You may need to make sure your browser is already logged into the
 right account if you are trying to authenticate to multiple accounts
