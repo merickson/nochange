@@ -19,6 +19,7 @@ use crate::sync::{
     CloudSynchronizer, LocalLocationActionKind, SyncActionKind, SyncError, SyncProgress,
     SyncProgressReporter, SyncSummary,
 };
+use chrono::{TimeDelta, Utc};
 use directories::BaseDirs;
 use secrecy::SecretString;
 use std::path::Path;
@@ -236,6 +237,8 @@ async fn run_sync(
         .ok_or(StateError::InvalidPath)
         .map_err(SyncError::from)?;
     let fsync_enabled = !arguments.no_fsync;
+    let initial_message_received_since =
+        get_initial_message_received_since(arguments.since_days, Utc::now());
     let mut state = StateDatabase::open_with_fsync(&paths.state_database, fsync_enabled)
         .map_err(SyncError::from)?;
     let profiles = GraphProfileVerifier;
@@ -247,6 +250,11 @@ async fn run_sync(
             reporter.show_status(
                 "WARNING: fsync is disabled; interruption may corrupt or lose local sync data",
             );
+        }
+        if let Some(days) = arguments.since_days {
+            reporter.show_status(&format!(
+                "limiting uncheckpointed message history to the previous {days} days"
+            ));
         }
         reporter.show_status("acquiring account synchronization lock");
         let result = async {
@@ -270,8 +278,12 @@ async fn run_sync(
                 });
             }
             reporter.show_status("mailbox identity verified");
-            let graph =
-                GraphTransport::build_with_fsync(tokens, Arc::new(TokioSleeper), fsync_enabled)?;
+            let graph = GraphTransport::build_with_fsync_and_since(
+                tokens,
+                Arc::new(TokioSleeper),
+                fsync_enabled,
+                initial_message_received_since,
+            )?;
             let maildir = MaildirStore::new_with_fsync(&account.maildir, fsync_enabled);
             reporter.show_status(if arguments.dry_run {
                 "starting synchronization dry-run"
@@ -297,6 +309,13 @@ async fn run_sync(
     } else {
         Err(AppError::Temporary(failures.join("; ")))
     }
+}
+
+fn get_initial_message_received_since(
+    since_days: Option<u32>,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    since_days.map(|days| now - TimeDelta::days(i64::from(days)))
 }
 
 struct ConsoleSyncReporter {
@@ -529,8 +548,29 @@ fn show_sync_summary(account: &str, summary: SyncSummary, dry_run: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_safe_log_value, get_sync_progress_message, report_send_success};
+    use super::{
+        get_initial_message_received_since, get_safe_log_value, get_sync_progress_message,
+        report_send_success,
+    };
     use crate::sync::{LocalLocationActionKind, SyncProgress};
+    use chrono::{DateTime, Utc};
+
+    #[test]
+    fn computes_initial_history_cutoff_from_an_injected_clock() {
+        let now = "2026-08-09T12:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("test clock should parse");
+
+        assert_eq!(
+            get_initial_message_received_since(Some(90), now),
+            Some(
+                "2026-05-11T12:00:00Z"
+                    .parse::<DateTime<Utc>>()
+                    .expect("expected cutoff should parse")
+            )
+        );
+        assert_eq!(get_initial_message_received_since(None, now), None);
+    }
 
     #[test]
     fn successful_send_produces_no_output() {

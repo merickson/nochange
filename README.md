@@ -128,7 +128,19 @@ Then perform the cloud-to-local synchronization:
 nochange sync
 ```
 
-You can specify `--account <account_name>` to act only on one account.
+You can specify `--account <account_name>` to act only on one account. To
+bound a new folder's initial import, specify a positive history window:
+
+```console
+nochange sync --since-days 90
+```
+
+The window becomes a `receivedDateTime` filter on only the initial message
+delta request. Microsoft carries that filter into the returned delta token, so
+later runs remain incremental without recomputing or locally filtering message
+history. Folders that already have checkpoints ignore the option; changing it
+does not prune or backfill an existing local mailbox. Omitting the option keeps
+Nochange's full-history default.
 
 ### Sending Mail
 
@@ -149,7 +161,7 @@ compatibility and are not actually used.
 nochange [--config PATH] [--verbose] <COMMAND>
 
 nochange init [--account NAME] [--device-code]
-nochange sync [--account NAME] [--dry-run] [--no-fsync]
+nochange sync [--account NAME] [--dry-run] [--no-fsync] [--since-days DAYS]
 nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-o] [-i] [--] [RECIPIENT...]
 ```
 
@@ -169,6 +181,13 @@ During an initial sync, it also uses Graph's current folder item count to show
 an explicitly approximate per-folder percentage; the final delta link remains
 the authoritative completion signal. Incremental rounds omit this estimate
 because total folder size does not predict the number of changes.
+
+`--since-days DAYS` accepts values from 1 through 36500 and limits only folders
+without an existing message checkpoint. Microsoft documents this message-delta
+filter as `receivedDateTime ge ...` and limits filtered delta queries to 5,000
+messages per folder. For unusually high-volume folders, use a shorter window or
+the unfiltered full-history mode. See [Get incremental changes to messages in a
+folder](https://learn.microsoft.com/graph/delta-query-messages).
 
 Add the global `--verbose` option for returned page counts and every message
 action:
@@ -259,8 +278,9 @@ mailboxes, aliases, and sovereign clouds are outside its initial scope.
 
 ## Sync Process
 
-The first run creates private Maildirs under the configured account
-root and downloads each selected folder's complete history. MIME
+The first run creates private Maildirs under the configured account root and
+downloads each selected folder's complete history, unless `--since-days` sets
+an initial received-time boundary. MIME
 transfer uses up to four concurrent downloads, followed by
 deterministic local commits. Later runs resume from opaque Microsoft
 Graph delta links. A failed or interrupted round leaves its message

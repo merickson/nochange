@@ -57,6 +57,20 @@ pub struct SyncArgs {
     /// Disable fsync for this run, risking corruption or data loss on interruption.
     #[arg(long)]
     pub no_fsync: bool,
+
+    /// Limit uncheckpointed folder history to messages received in the last DAYS days.
+    #[arg(long, value_name = "DAYS", value_parser = parse_history_days)]
+    pub since_days: Option<u32>,
+}
+
+fn parse_history_days(value: &str) -> Result<u32, String> {
+    let days = value
+        .parse::<u32>()
+        .map_err(|_| "history window must be a positive number of days".to_owned())?;
+    if !(1..=36_500).contains(&days) {
+        return Err("history window must be between 1 and 36500 days".to_owned());
+    }
+    Ok(days)
 }
 
 /// Arguments for the sendmail-compatible sending interface.
