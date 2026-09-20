@@ -10,6 +10,10 @@ for GMail, and is designed to provide capability similar to the
 pairing of OfflineIMAP and msmtp. Unlike lieer, we don't integrate
 into a MUA, but simply sync to a maildir.
 
+## AI Admission of Guilt
+The project was entirely coded with Codex from human-written plans. I've read the 
+source end to end, but I had the clankers working for me.
+
 ## Using nochange
 
 ### Prerequisites
