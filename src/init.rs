@@ -122,7 +122,11 @@ where
         refresh_token: &SecretString,
     ) -> Result<TokenGrant, AuthError> {
         let endpoints = self.get_endpoints(account)?;
-        let exchange = EntraTokenExchange::build(&account.client_id, &endpoints)?;
+        let client_id = account
+            .client_id
+            .as_deref()
+            .ok_or(AuthError::InvalidClientId)?;
+        let exchange = EntraTokenExchange::build(client_id, &endpoints)?;
         exchange.exchange_refresh_token(refresh_token).await
     }
 
@@ -133,12 +137,16 @@ where
         prompter: &dyn LoginPrompter,
     ) -> Result<TokenGrant, AuthError> {
         let endpoints = self.get_endpoints(account)?;
-        let exchange = EntraTokenExchange::build(&account.client_id, &endpoints)?;
+        let client_id = account
+            .client_id
+            .as_deref()
+            .ok_or(AuthError::InvalidClientId)?;
+        let exchange = EntraTokenExchange::build(client_id, &endpoints)?;
         match method {
             LoginMethod::Browser => {
                 let listener = LocalCallbackListener::bind()?;
                 let session = AuthorizationSession::build(
-                    &account.client_id,
+                    client_id,
                     &endpoints,
                     listener.get_redirect_url().clone(),
                 )?;
@@ -366,7 +374,8 @@ mod tests {
             name: "work".into(),
             maildir: PathBuf::from("/mail/work"),
             user: "me@example.com".into(),
-            client_id: "client-id".into(),
+            client_id: Some("client-id".into()),
+            token_command: None,
             tenant: "organizations".into(),
             folder_separator: ".".into(),
             folder_filter: FolderFilter::All,

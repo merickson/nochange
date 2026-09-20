@@ -5,6 +5,7 @@ use crate::model::{
     DeltaChange, DeltaPage, FollowUpState, MessageFlags, RemoteFolderMetadata, RemoteMessage,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::StreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Method;
@@ -120,6 +121,7 @@ pub struct GraphTransport<P, S> {
     retry_policy: RetryPolicy,
     http_client: reqwest::Client,
     fsync_enabled: bool,
+    initial_message_received_since: Option<DateTime<Utc>>,
 }
 
 impl<P, S> GraphTransport<P, S>
@@ -138,6 +140,16 @@ where
         sleeper: Arc<S>,
         fsync_enabled: bool,
     ) -> Result<Self, GraphError> {
+        Self::build_with_fsync_and_since(token_provider, sleeper, fsync_enabled, None)
+    }
+
+    /// Build a Graph client with durability and an optional initial history boundary.
+    pub fn build_with_fsync_and_since(
+        token_provider: Arc<P>,
+        sleeper: Arc<S>,
+        fsync_enabled: bool,
+        initial_message_received_since: Option<DateTime<Utc>>,
+    ) -> Result<Self, GraphError> {
         let http_client = build_http_client()?;
         Ok(Self {
             token_provider,
@@ -145,6 +157,7 @@ where
             retry_policy: RetryPolicy::default(),
             http_client,
             fsync_enabled,
+            initial_message_received_since,
         })
     }
 
@@ -175,6 +188,7 @@ where
             retry_policy,
             http_client: build_http_client_with_timeout(request_timeout)?,
             fsync_enabled: true,
+            initial_message_received_since: None,
         })
     }
 
@@ -232,11 +246,22 @@ where
         folder_id: &str,
         checkpoint: Option<&str>,
     ) -> Result<DeltaPage<RemoteMessage>, GraphError> {
-        let url = match checkpoint {
-            Some(checkpoint) => GraphUrl::build(checkpoint)?,
-            None => get_initial_message_delta_url(folder_id)?,
-        };
+        let url = self.get_message_delta_url(folder_id, checkpoint)?;
         self.get_message_delta_page_from(folder_id, &url).await
+    }
+
+    fn get_message_delta_url(
+        &self,
+        folder_id: &str,
+        checkpoint: Option<&str>,
+    ) -> Result<GraphUrl, GraphError> {
+        Ok(match checkpoint {
+            Some(checkpoint) => GraphUrl::build(checkpoint)?,
+            None => get_initial_message_delta_url(
+                folder_id,
+                self.initial_message_received_since.as_ref(),
+            )?,
+        })
     }
 
     /// Stream one message's MIME representation to a newly created file.
@@ -873,14 +898,27 @@ fn get_initial_folder_delta_url() -> Result<GraphUrl, GraphError> {
     )
 }
 
-fn get_initial_message_delta_url(folder_id: &str) -> Result<GraphUrl, GraphError> {
+fn get_initial_message_delta_url(
+    folder_id: &str,
+    received_since: Option<&DateTime<Utc>>,
+) -> Result<GraphUrl, GraphError> {
     if folder_id.is_empty() {
         return Err(GraphError::MalformedJson);
     }
     let encoded_id = utf8_percent_encode(folder_id, NON_ALPHANUMERIC);
-    GraphUrl::build(&format!(
+    let base = GraphUrl::build(&format!(
         "/me/mailFolders/{encoded_id}/messages/delta?$select=id,parentFolderId,internetMessageId,lastModifiedDateTime,isRead,flag"
-    ))
+    ))?;
+    let Some(received_since) = received_since else {
+        return Ok(base);
+    };
+    let mut url = Url::parse(base.as_str()).map_err(|_| GraphError::UnexpectedUrl)?;
+    let value = format!(
+        "receivedDateTime ge {}",
+        received_since.to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    url.query_pairs_mut().append_pair("$filter", &value);
+    GraphUrl::build(url.as_str())
 }
 
 fn get_message_metadata_url(
@@ -1120,6 +1158,7 @@ mod tests {
         DeltaChange, DeltaPage, FollowUpState, MessageFlags, RemoteFolderMetadata, RemoteMessage,
     };
     use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
     use secrecy::SecretString;
     use serde::Deserialize;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1127,6 +1166,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task::JoinHandle;
+    use url::Url;
     use wiremock::matchers::{body_json, body_string, header, header_regex, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -2387,10 +2427,45 @@ mod tests {
             "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$select=id,parentFolderId,displayName,isHidden,totalItemCount"
         );
         assert_eq!(
-            get_initial_message_delta_url("folder/id?secret")
+            get_initial_message_delta_url("folder/id?secret", None)
                 .expect("folder ID should encode")
                 .as_str(),
             "https://graph.microsoft.com/v1.0/me/mailFolders/folder%2Fid%3Fsecret/messages/delta?$select=id,parentFolderId,internetMessageId,lastModifiedDateTime,isRead,flag"
+        );
+    }
+
+    #[test]
+    fn limits_only_initial_message_delta_urls_by_received_time() {
+        let cutoff = "2026-05-11T12:34:56Z"
+            .parse::<DateTime<Utc>>()
+            .expect("cutoff should parse");
+        let transport = GraphTransport::build_with_fsync_and_since(
+            Arc::new(FakeTokenProvider::default()),
+            Arc::new(RecordingSleeper::default()),
+            true,
+            Some(cutoff),
+        )
+        .expect("Graph transport should build");
+        let initial = transport
+            .get_message_delta_url("inbox", None)
+            .expect("filtered message delta URL should build");
+        let parsed = Url::parse(initial.as_str()).expect("Graph URL should parse");
+        let filter = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "$filter").then(|| value.into_owned()));
+
+        assert_eq!(
+            filter.as_deref(),
+            Some("receivedDateTime ge 2026-05-11T12:34:56Z")
+        );
+
+        let checkpoint = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=opaque";
+        assert_eq!(
+            transport
+                .get_message_delta_url("inbox", Some(checkpoint))
+                .expect("checkpoint should remain valid")
+                .as_str(),
+            checkpoint
         );
     }
 }

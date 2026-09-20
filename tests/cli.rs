@@ -38,21 +38,37 @@ fn parses_sync_options() {
         "work",
         "--dry-run",
         "--no-fsync",
+        "--since-days",
+        "90",
     ])
     .expect("the documented sync command should parse");
 
     assert!(matches!(
         cli.command,
         NochangeCommand::Sync(args)
-            if args.account.as_deref() == Some("work") && args.dry_run && args.no_fsync
+            if args.account.as_deref() == Some("work")
+                && args.dry_run
+                && args.no_fsync
+                && args.since_days == Some(90)
     ));
 
     let defaults =
         Cli::try_parse_from(["nochange", "sync"]).expect("default sync command should parse");
     assert!(matches!(
         defaults.command,
-        NochangeCommand::Sync(args) if !args.dry_run && !args.no_fsync
+        NochangeCommand::Sync(args)
+            if !args.dry_run && !args.no_fsync && args.since_days.is_none()
     ));
+}
+
+#[test]
+fn rejects_invalid_sync_history_windows() {
+    for days in ["0", "36501", "not-a-number"] {
+        let error = Cli::try_parse_from(["nochange", "sync", "--since-days", days])
+            .expect_err("invalid history windows should be rejected");
+
+        assert_eq!(error.exit_code(), 2);
+    }
 }
 
 #[test]

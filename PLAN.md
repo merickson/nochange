@@ -76,7 +76,7 @@ Provide a `nochange` binary with these interfaces:
 nochange [--config PATH] [--verbose] <COMMAND>
 
 nochange init [--account NAME] [--device-code]
-nochange sync [--account NAME] [--dry-run]
+nochange sync [--account NAME] [--dry-run] [--since-days DAYS]
 nochange send [-a ACCOUNT] [-f ADDRESS] [-t] [-o] [-i] [--] [RECIPIENT...]
 ```
 
@@ -85,6 +85,7 @@ Behavior:
 - `init` validates configuration, obtains consent, verifies `/me`, initializes state, and creates selected Maildirs. It does not upload or delete messages.
 - `sync` processes all configured accounts serially unless one account is selected. Continue to later accounts after an account failure and return nonzero if any account failed.
 - `sync --dry-run` performs discovery and reconciliation planning but makes no Graph, Maildir, checkpoint, or journal mutations.
+- `sync --since-days DAYS` applies a received-time boundary only to initial message-delta rounds. Persist the server-issued filtered delta links and never reinterpret the option as local retention or pruning.
 - `send` reads one RFC message from stdin. `-o`, `-i`, grouped `-oi`, and
   `-f ADDRESS` are accepted no-ops for common sendmail callers.
 - Without `-a`, infer the unique configured account whose `user` matches the
@@ -201,7 +202,7 @@ For each account:
 
 Synchronization semantics:
 
-- The first sync downloads complete selected-folder history and never interprets pre-existing local files as remote deletions.
+- The first sync downloads complete selected-folder history by default, or the server-filtered received-time window requested with `--since-days`, and never interprets pre-existing local files as remote deletions.
 - Deterministic keys and staged changes make interrupted initial and incremental runs idempotent.
 - Map Maildir `S` bidirectionally to Graph `isRead`.
 - Map Maildir `F` bidirectionally to Graph follow-up flagged/not-flagged; represent Graph completed flags locally as `F` and clear completion when the user removes `F`.
@@ -302,7 +303,7 @@ Initial scope:
 
 - Global commercial Microsoft 365.
 - Delegated access to the signed-in user's primary mailbox.
-- Complete-history synchronization.
+- Complete-history synchronization by default, with an optional bounded initial-history window.
 - Serial account processing.
 - Existing remote mail folders and local Maildirs.
 - Seen, Flagged, trash, and managed-folder moves.

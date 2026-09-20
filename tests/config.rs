@@ -87,7 +87,8 @@ fn loads_valid_configuration_with_defaults_and_normalized_filters() {
             .join("mail")
     );
     assert_eq!(account.user, "me@example.com");
-    assert_eq!(account.client_id, "client-id");
+    assert_eq!(account.client_id.as_deref(), Some("client-id"));
+    assert_eq!(account.token_command, None);
     assert_eq!(account.tenant, "organizations");
     assert_eq!(account.folder_separator, ".");
     assert_eq!(
@@ -98,6 +99,31 @@ fn loads_valid_configuration_with_defaults_and_normalized_filters() {
     assert!(!account.is_folder_selected("archive/OLD/receipts"));
     assert!(account.is_folder_selected("Archive"));
     assert!(account.is_folder_selected("Journalism"));
+}
+
+#[test]
+fn loads_external_token_command_without_a_client_id() {
+    let temp_dir = TempDir::new().expect("temporary directory should be created");
+    let path = write_config(
+        &temp_dir,
+        "[global]\naccounts = work\n[work]\nmaildir = mail\nuser = me@example.com\ntokencommand = bin/graph-token\n",
+    );
+
+    let config =
+        AppConfig::load_from(&path, temp_dir.path()).expect("token command config should load");
+    let account = config.get_account("work").expect("account should exist");
+
+    assert_eq!(account.client_id, None);
+    assert_eq!(
+        account.token_command,
+        Some(
+            temp_dir
+                .path()
+                .canonicalize()
+                .expect("temporary root should be canonicalizable")
+                .join("bin/graph-token")
+        )
+    );
 }
 
 #[test]
@@ -191,6 +217,10 @@ fn rejects_invalid_configuration_contracts() {
         (
             "client secrets",
             "[global]\naccounts = work\n[work]\nmaildir = /tmp/work\nuser = me@example.com\nclientid = id\nclientsecret = secret\n",
+        ),
+        (
+            "client id and token command together",
+            "[global]\naccounts = work\n[work]\nmaildir = /tmp/work\nuser = me@example.com\nclientid = id\ntokencommand = /tmp/token\n",
         ),
         (
             "include and exclude together",
@@ -335,9 +365,9 @@ fn reports_specific_structural_and_path_errors() {
             "missing_key",
         ),
         (
-            "missing client id",
+            "missing authentication",
             "[global]\naccounts = work\n[work]\nmaildir = /tmp/work\nuser = me@example.com\n",
-            "missing_key",
+            "missing_authentication",
         ),
         (
             "unsupported named home",
@@ -353,6 +383,7 @@ fn reports_specific_structural_and_path_errors() {
         let actual = match error {
             ConfigError::MissingSection(_) => "missing_section",
             ConfigError::MissingKey { .. } => "missing_key",
+            ConfigError::MissingAuthentication(_) => "missing_authentication",
             ConfigError::InvalidPath { .. } => "invalid_path",
             other => panic!("unexpected error for {name}: {other}"),
         };
